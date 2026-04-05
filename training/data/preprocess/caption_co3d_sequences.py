@@ -8,7 +8,7 @@ This script supports two input modes:
 In either case it:
 1. Enumerates valid sequences.
 2. Samples a few representative frames from each sequence.
-3. Runs a local Qwen2.5-VL model to produce one descriptive caption per sequence.
+3. Runs a local Qwen2.5-VL model to produce one or two caption variants per sequence.
 4. Writes a JSONL manifest keyed by ``dataset_seq_name``.
 
 The intent is to run this on a GPU machine such as SCC, not inside the training loop.
@@ -36,6 +36,7 @@ import argparse
 import gzip
 import json
 import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,13 +91,33 @@ DEFAULT_SEEN_CATEGORIES = [
 ]
 
 
-DEFAULT_PROMPT_TEMPLATE = (
+DEFAULT_SINGLE_PROMPT_TEMPLATE = (
     "These images are different views from the same 3D capture sequence. "
     "Write one concise caption describing the shared main object and stable visible context across the views. "
     "Mention the object type and clear visual attributes such as color, material, shape, or scene context only when they are clearly supported by the images. "
     "Do not mention camera motion, viewpoint changes, or uncertain details. "
     "Output exactly one sentence."
 )
+
+
+DEFAULT_DUAL_PROMPT_TEMPLATE = (
+    "These images are different views from the same 3D capture sequence. "
+    "Write two caption versions in the exact format below.\n"
+    "Concise description: a short summary of the main object and stable scene content shared across the views.\n"
+    "Concise extra information: short helpful context such as viewpoint changes, lighting variation, visible text, occlusion, or background cues that may help representation learning.\n"
+    "Detailed description: a more descriptive version of the main object and stable scene content, still grounded in the images.\n"
+    "Detailed extra information: a more descriptive version of the extra information, still grounded in the images.\n"
+    "Keep the concise fields short. Keep the detailed fields moderately descriptive, but do not ramble. "
+    "Do not use bullet points or any additional labels beyond the four required lines."
+)
+
+
+DUAL_OUTPUT_LABELS = {
+    "concise_description": "Concise description",
+    "concise_extra_information": "Concise extra information",
+    "detailed_description": "Detailed description",
+    "detailed_extra_information": "Detailed extra information",
+}
 
 
 @dataclass
@@ -199,7 +220,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=96,
+        default=192,
         help="Generation cap for the caption output.",
     )
     parser.add_argument(
@@ -219,6 +240,13 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional text file overriding the default prompt template.",
+    )
+    parser.add_argument(
+        "--caption-format",
+        type=str,
+        default="dual",
+        choices=["single", "dual"],
+        help="Whether to request one caption or both concise and descriptive variants in one generation.",
     )
     parser.add_argument(
         "--use-category-hint",
@@ -255,7 +283,9 @@ def resolve_torch_dtype(dtype_name: str):
 
 def load_prompt(args: argparse.Namespace) -> str:
     if args.prompt_file is None:
-        return DEFAULT_PROMPT_TEMPLATE
+        if args.caption_format == "dual":
+            return DEFAULT_DUAL_PROMPT_TEMPLATE
+        return DEFAULT_SINGLE_PROMPT_TEMPLATE
     return args.prompt_file.read_text(encoding="utf-8").strip()
 
 
@@ -403,6 +433,98 @@ def build_prompt(prompt_template: str, category: str, use_category_hint: bool) -
     return f"{prompt_template} The known category label is '{category}'."
 
 
+def parse_dual_caption_output(raw_text: str) -> dict[str, str]:
+    parsed = {key: "" for key in DUAL_OUTPUT_LABELS}
+    current_key = None
+
+    for raw_line in raw_text.replace("\r", "\n").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        matched_key = None
+        for key, label in DUAL_OUTPUT_LABELS.items():
+            prefix = f"{label}:"
+            if line.lower().startswith(prefix.lower()):
+                matched_key = key
+                value = line[len(prefix):].strip()
+                parsed[key] = value
+                current_key = key
+                break
+
+        if matched_key is None and current_key is not None:
+            parsed[current_key] = f"{parsed[current_key]} {line}".strip()
+
+    return parsed
+
+
+def clean_caption_text(text: str | None) -> str | None:
+    if text is None:
+        return None
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    return cleaned or None
+
+
+def combine_description_and_extra(description: str | None, extra_information: str | None) -> str | None:
+    description = clean_caption_text(description)
+    extra_information = clean_caption_text(extra_information)
+
+    if description and extra_information:
+        return f"Description: {description} Extra information: {extra_information}"
+    if description:
+        return f"Description: {description}"
+    if extra_information:
+        return f"Extra information: {extra_information}"
+    return None
+
+
+def extract_caption_payload(raw_output: str, caption_format: str) -> dict[str, str | None]:
+    raw_output = clean_caption_text(raw_output)
+
+    if caption_format == "single":
+        return {
+            "raw_output": raw_output,
+            "caption": raw_output,
+            "caption_concise": raw_output,
+            "caption_descriptive": None,
+            "concise_description": raw_output,
+            "concise_extra_information": None,
+            "detailed_description": None,
+            "detailed_extra_information": None,
+            "parse_status": "single",
+        }
+
+    parsed = {
+        key: clean_caption_text(value)
+        for key, value in parse_dual_caption_output(raw_output or "").items()
+    }
+    caption_concise = combine_description_and_extra(
+        parsed["concise_description"],
+        parsed["concise_extra_information"],
+    )
+    caption_descriptive = combine_description_and_extra(
+        parsed["detailed_description"],
+        parsed["detailed_extra_information"],
+    )
+
+    parse_status = "parsed"
+    if not caption_concise and raw_output:
+        caption_concise = raw_output
+        parse_status = "fallback_raw_output"
+
+    return {
+        "raw_output": raw_output,
+        "caption": caption_concise,
+        "caption_concise": caption_concise,
+        "caption_descriptive": caption_descriptive,
+        "concise_description": parsed["concise_description"],
+        "concise_extra_information": parsed["concise_extra_information"],
+        "detailed_description": parsed["detailed_description"],
+        "detailed_extra_information": parsed["detailed_extra_information"],
+        "parse_status": parse_status,
+    }
+
+
 def read_existing_keys(output_path: Path) -> set[str]:
     if not output_path.exists():
         return set()
@@ -519,6 +641,7 @@ def write_metadata(
         "max_sequences_per_category": args.max_sequences_per_category,
         "shuffle": args.shuffle,
         "seed": args.seed,
+        "caption_format": args.caption_format,
         "use_category_hint": args.use_category_hint,
         "prompt": prompt_text,
         "total_sequences_selected": len(sequences),
@@ -592,6 +715,14 @@ def main() -> None:
                     "sampled_frame_indices": sampled_indices,
                     "sampled_image_paths": [str(path) for path in sampled_image_paths],
                     "caption": None,
+                    "caption_concise": None,
+                    "caption_descriptive": None,
+                    "concise_description": None,
+                    "concise_extra_information": None,
+                    "detailed_description": None,
+                    "detailed_extra_information": None,
+                    "raw_output": None,
+                    "parse_status": "missing_images",
                     "status": "missing_images",
                     "missing_image_paths": missing_paths,
                     "elapsed_seconds": elapsed_seconds,
@@ -610,7 +741,7 @@ def main() -> None:
             )
 
             try:
-                caption = generate_caption(
+                raw_output = generate_caption(
                     model=model,
                     processor=processor,
                     process_vision_info=process_vision_info,
@@ -618,10 +749,24 @@ def main() -> None:
                     prompt_text=prompt_text,
                     max_new_tokens=args.max_new_tokens,
                 )
+                caption_payload = extract_caption_payload(
+                    raw_output=raw_output,
+                    caption_format=args.caption_format,
+                )
                 status = "ok"
                 error_message = None
             except Exception as exc:  # pragma: no cover - runtime failure path
-                caption = None
+                caption_payload = {
+                    "raw_output": None,
+                    "caption": None,
+                    "caption_concise": None,
+                    "caption_descriptive": None,
+                    "concise_description": None,
+                    "concise_extra_information": None,
+                    "detailed_description": None,
+                    "detailed_extra_information": None,
+                    "parse_status": "error",
+                }
                 status = "error"
                 error_message = str(exc)
 
@@ -638,7 +783,15 @@ def main() -> None:
                 "num_frames_in_sequence": len(record.image_paths),
                 "sampled_frame_indices": sampled_indices,
                 "sampled_image_paths": [str(path) for path in sampled_image_paths],
-                "caption": caption,
+                "caption": caption_payload["caption"],
+                "caption_concise": caption_payload["caption_concise"],
+                "caption_descriptive": caption_payload["caption_descriptive"],
+                "concise_description": caption_payload["concise_description"],
+                "concise_extra_information": caption_payload["concise_extra_information"],
+                "detailed_description": caption_payload["detailed_description"],
+                "detailed_extra_information": caption_payload["detailed_extra_information"],
+                "raw_output": caption_payload["raw_output"],
+                "parse_status": caption_payload["parse_status"],
                 "status": status,
                 "error": error_message,
                 "elapsed_seconds": elapsed_seconds,
