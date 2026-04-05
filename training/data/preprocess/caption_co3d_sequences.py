@@ -102,22 +102,12 @@ DEFAULT_SINGLE_PROMPT_TEMPLATE = (
 
 DEFAULT_DUAL_PROMPT_TEMPLATE = (
     "These images are different views from the same 3D capture sequence. "
-    "Write two caption versions in the exact format below.\n"
-    "Concise description: a short summary of the main object and stable scene content shared across the views.\n"
-    "Concise extra information: short helpful context such as viewpoint changes, lighting variation, visible text, occlusion, or background cues that may help representation learning.\n"
-    "Detailed description: a more descriptive version of the main object and stable scene content, still grounded in the images.\n"
-    "Detailed extra information: a more descriptive version of the extra information, still grounded in the images.\n"
-    "Keep the concise fields short. Keep the detailed fields moderately descriptive, but do not ramble. "
-    "Do not use bullet points or any additional labels beyond the four required lines."
+    "Return only valid JSON with exactly these keys: "
+    "\"caption_concise\" and \"caption_descriptive\". "
+    "\"caption_concise\" should be short and include the main object, stable scene content, and concise extra information that may help representation learning. "
+    "\"caption_descriptive\" should be a more descriptive but still grounded version. "
+    "Do not include markdown fences, comments, or any extra keys."
 )
-
-
-DUAL_OUTPUT_LABELS = {
-    "concise_description": "Concise description",
-    "concise_extra_information": "Concise extra information",
-    "detailed_description": "Detailed description",
-    "detailed_extra_information": "Detailed extra information",
-}
 
 
 @dataclass
@@ -433,31 +423,6 @@ def build_prompt(prompt_template: str, category: str, use_category_hint: bool) -
     return f"{prompt_template} The known category label is '{category}'."
 
 
-def parse_dual_caption_output(raw_text: str) -> dict[str, str]:
-    parsed = {key: "" for key in DUAL_OUTPUT_LABELS}
-    current_key = None
-
-    for raw_line in raw_text.replace("\r", "\n").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        matched_key = None
-        for key, label in DUAL_OUTPUT_LABELS.items():
-            prefix = f"{label}:"
-            if line.lower().startswith(prefix.lower()):
-                matched_key = key
-                value = line[len(prefix):].strip()
-                parsed[key] = value
-                current_key = key
-                break
-
-        if matched_key is None and current_key is not None:
-            parsed[current_key] = f"{parsed[current_key]} {line}".strip()
-
-    return parsed
-
-
 def clean_caption_text(text: str | None) -> str | None:
     if text is None:
         return None
@@ -465,17 +430,31 @@ def clean_caption_text(text: str | None) -> str | None:
     return cleaned or None
 
 
-def combine_description_and_extra(description: str | None, extra_information: str | None) -> str | None:
-    description = clean_caption_text(description)
-    extra_information = clean_caption_text(extra_information)
+def extract_json_object(raw_output: str) -> dict | None:
+    if raw_output is None:
+        return None
 
-    if description and extra_information:
-        return f"Description: {description} Extra information: {extra_information}"
-    if description:
-        return f"Description: {description}"
-    if extra_information:
-        return f"Extra information: {extra_information}"
-    return None
+    raw_output = raw_output.strip()
+    if not raw_output:
+        return None
+
+    try:
+        parsed = json.loads(raw_output)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    start = raw_output.find("{")
+    end = raw_output.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    candidate = raw_output[start : end + 1]
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
 
 
 def extract_caption_payload(raw_output: str, caption_format: str) -> dict[str, str | None]:
@@ -487,40 +466,26 @@ def extract_caption_payload(raw_output: str, caption_format: str) -> dict[str, s
             "caption": raw_output,
             "caption_concise": raw_output,
             "caption_descriptive": None,
-            "concise_description": raw_output,
-            "concise_extra_information": None,
-            "detailed_description": None,
-            "detailed_extra_information": None,
             "parse_status": "single",
         }
 
-    parsed = {
-        key: clean_caption_text(value)
-        for key, value in parse_dual_caption_output(raw_output or "").items()
-    }
-    caption_concise = combine_description_and_extra(
-        parsed["concise_description"],
-        parsed["concise_extra_information"],
-    )
-    caption_descriptive = combine_description_and_extra(
-        parsed["detailed_description"],
-        parsed["detailed_extra_information"],
-    )
+    parsed = extract_json_object(raw_output or "")
+    caption_concise = None
+    caption_descriptive = None
 
     parse_status = "parsed"
+    if parsed is not None:
+        caption_concise = clean_caption_text(parsed.get("caption_concise"))
+        caption_descriptive = clean_caption_text(parsed.get("caption_descriptive"))
+
     if not caption_concise and raw_output:
         caption_concise = raw_output
         parse_status = "fallback_raw_output"
 
     return {
         "raw_output": raw_output,
-        "caption": caption_concise,
         "caption_concise": caption_concise,
         "caption_descriptive": caption_descriptive,
-        "concise_description": parsed["concise_description"],
-        "concise_extra_information": parsed["concise_extra_information"],
-        "detailed_description": parsed["detailed_description"],
-        "detailed_extra_information": parsed["detailed_extra_information"],
         "parse_status": parse_status,
     }
 
@@ -714,13 +679,8 @@ def main() -> None:
                     "num_frames_in_sequence": len(record.image_paths),
                     "sampled_frame_indices": sampled_indices,
                     "sampled_image_paths": [str(path) for path in sampled_image_paths],
-                    "caption": None,
                     "caption_concise": None,
                     "caption_descriptive": None,
-                    "concise_description": None,
-                    "concise_extra_information": None,
-                    "detailed_description": None,
-                    "detailed_extra_information": None,
                     "raw_output": None,
                     "parse_status": "missing_images",
                     "status": "missing_images",
@@ -758,13 +718,8 @@ def main() -> None:
             except Exception as exc:  # pragma: no cover - runtime failure path
                 caption_payload = {
                     "raw_output": None,
-                    "caption": None,
                     "caption_concise": None,
                     "caption_descriptive": None,
-                    "concise_description": None,
-                    "concise_extra_information": None,
-                    "detailed_description": None,
-                    "detailed_extra_information": None,
                     "parse_status": "error",
                 }
                 status = "error"
@@ -783,13 +738,8 @@ def main() -> None:
                 "num_frames_in_sequence": len(record.image_paths),
                 "sampled_frame_indices": sampled_indices,
                 "sampled_image_paths": [str(path) for path in sampled_image_paths],
-                "caption": caption_payload["caption"],
                 "caption_concise": caption_payload["caption_concise"],
                 "caption_descriptive": caption_payload["caption_descriptive"],
-                "concise_description": caption_payload["concise_description"],
-                "concise_extra_information": caption_payload["concise_extra_information"],
-                "detailed_description": caption_payload["detailed_description"],
-                "detailed_extra_information": caption_payload["detailed_extra_information"],
                 "raw_output": caption_payload["raw_output"],
                 "parse_status": caption_payload["parse_status"],
                 "status": status,
