@@ -1,16 +1,19 @@
 """
-Offline sequence captioning for the Co3D data used by VGGT training.
+Offline sequence captioning for Co3D data used by VGGT-style training.
 
-This script:
-1. Loads the same Co3D-style annotation files that VGGT training consumes.
-2. Enumerates valid sequences for a split.
-3. Samples a few representative frames from each sequence.
-4. Runs a local Qwen2.5-VL model to produce one descriptive caption per sequence.
-5. Writes a JSONL manifest keyed by the exact ``seq_name`` format used by the dataset.
+This script supports two input modes:
+1. The VGGT training setup with external ``*.jgz`` annotation files.
+2. A raw Co3D directory scan, which is useful for the official single-sequence subset.
+
+In either case it:
+1. Enumerates valid sequences.
+2. Samples a few representative frames from each sequence.
+3. Runs a local Qwen2.5-VL model to produce one descriptive caption per sequence.
+4. Writes a JSONL manifest keyed by ``dataset_seq_name``.
 
 The intent is to run this on a GPU machine such as SCC, not inside the training loop.
 
-Example:
+Examples:
     python training/data/preprocess/caption_co3d_sequences.py \
         --co3d-dir /path/to/co3d \
         --co3d-annotation-dir /path/to/co3d_anno \
@@ -19,6 +22,12 @@ Example:
         --frames-per-sequence 4 \
         --max-sequences 1000 \
         --model-name Qwen/Qwen2.5-VL-3B-Instruct
+
+    python training/data/preprocess/caption_co3d_sequences.py \
+        --raw-co3d-root /path/to/co3d_subset \
+        --output-path /path/to/co3d_subset_captions.jsonl \
+        --frames-per-sequence 4 \
+        --max-sequences 50
 """
 
 from __future__ import annotations
@@ -27,6 +36,7 @@ import argparse
 import gzip
 import json
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Sequence
@@ -95,17 +105,34 @@ class SequenceRecord:
     split: str
     source_seq_name: str
     dataset_seq_name: str
-    annos: list
+    image_paths: list[str]
+
+
+@dataclass
+class SequenceCollection:
+    sequences: list[SequenceRecord]
+    total_eligible_sequences: int
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--co3d-dir", type=Path, required=True, help="Root directory of Co3D images.")
+    parser.add_argument(
+        "--co3d-dir",
+        type=Path,
+        default=None,
+        help="Root directory of Co3D images. Required when using --co3d-annotation-dir.",
+    )
     parser.add_argument(
         "--co3d-annotation-dir",
         type=Path,
-        required=True,
+        default=None,
         help="Directory containing <category>_<split>.jgz annotation files used by VGGT.",
+    )
+    parser.add_argument(
+        "--raw-co3d-root",
+        type=Path,
+        default=None,
+        help="Raw Co3D root to scan directly, useful for the official single-sequence subset.",
     )
     parser.add_argument("--output-path", type=Path, required=True, help="Output JSONL manifest path.")
     parser.add_argument("--split", type=str, default="train", choices=["train", "test"])
@@ -203,7 +230,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite an existing manifest instead of resuming.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.co3d_annotation_dir is not None and args.co3d_dir is None:
+        parser.error("--co3d-dir is required when --co3d-annotation-dir is provided")
+    if args.co3d_annotation_dir is None and args.raw_co3d_root is None:
+        parser.error("Provide either --co3d-annotation-dir with --co3d-dir, or --raw-co3d-root")
+    if args.co3d_annotation_dir is not None and args.raw_co3d_root is not None:
+        parser.error("Use either annotation mode or raw-scan mode, not both")
+
+    return args
 
 
 def resolve_torch_dtype(dtype_name: str):
@@ -228,9 +264,10 @@ def load_annotation_file(annotation_file: Path) -> Dict[str, list]:
         return json.loads(handle.read())
 
 
-def collect_sequences(args: argparse.Namespace) -> list[SequenceRecord]:
+def collect_sequences_from_annotations(args: argparse.Namespace) -> SequenceCollection:
     categories = sorted(args.categories or DEFAULT_SEEN_CATEGORIES)
     all_sequences: list[SequenceRecord] = []
+    total_eligible_sequences = 0
 
     for category in categories:
         annotation_file = args.co3d_annotation_dir / f"{category}_{args.split}.jgz"
@@ -243,13 +280,15 @@ def collect_sequences(args: argparse.Namespace) -> list[SequenceRecord]:
         for seq_name, seq_data in annotation.items():
             if len(seq_data) < args.min_num_images:
                 continue
+            total_eligible_sequences += 1
+            image_paths = [str((args.co3d_dir / anno["filepath"]).resolve()) for anno in seq_data]
             category_records.append(
                 SequenceRecord(
                     category=category,
                     split=args.split,
                     source_seq_name=seq_name,
                     dataset_seq_name=f"co3d_{seq_name}",
-                    annos=seq_data,
+                    image_paths=image_paths,
                 )
             )
 
@@ -267,7 +306,81 @@ def collect_sequences(args: argparse.Namespace) -> list[SequenceRecord]:
     if args.max_sequences is not None:
         all_sequences = all_sequences[: args.max_sequences]
 
-    return all_sequences
+    return SequenceCollection(
+        sequences=all_sequences,
+        total_eligible_sequences=total_eligible_sequences,
+    )
+
+
+def is_image_file(path: Path) -> bool:
+    return path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def collect_sequences_from_raw_root(args: argparse.Namespace) -> SequenceCollection:
+    root = args.raw_co3d_root.resolve()
+    categories = sorted(args.categories) if args.categories else sorted(
+        path.name for path in root.iterdir() if path.is_dir()
+    )
+    all_sequences: list[SequenceRecord] = []
+    total_eligible_sequences = 0
+
+    for category in categories:
+        category_dir = root / category
+        if not category_dir.is_dir():
+            continue
+
+        category_records = []
+        for sequence_dir in sorted(path for path in category_dir.iterdir() if path.is_dir()):
+            images_dir = sequence_dir / "images"
+            if not images_dir.is_dir():
+                continue
+            image_paths = sorted(str(path.resolve()) for path in images_dir.iterdir() if path.is_file() and is_image_file(path))
+            if len(image_paths) < args.min_num_images:
+                continue
+            total_eligible_sequences += 1
+
+            source_seq_name = f"{category}/{sequence_dir.name}"
+            category_records.append(
+                SequenceRecord(
+                    category=category,
+                    split="subset",
+                    source_seq_name=source_seq_name,
+                    dataset_seq_name=f"co3d_{source_seq_name}",
+                    image_paths=image_paths,
+                )
+            )
+
+        if args.shuffle:
+            random.shuffle(category_records)
+
+        if args.max_sequences_per_category is not None:
+            category_records = category_records[: args.max_sequences_per_category]
+
+        all_sequences.extend(category_records)
+
+    if args.shuffle:
+        random.shuffle(all_sequences)
+
+    if args.max_sequences is not None:
+        all_sequences = all_sequences[: args.max_sequences]
+
+    return SequenceCollection(
+        sequences=all_sequences,
+        total_eligible_sequences=total_eligible_sequences,
+    )
+
+
+def collect_sequences(args: argparse.Namespace) -> SequenceCollection:
+    if args.co3d_annotation_dir is not None:
+        return collect_sequences_from_annotations(args)
+    return collect_sequences_from_raw_root(args)
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = int(round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def evenly_spaced_indices(length: int, count: int) -> list[int]:
@@ -382,13 +495,24 @@ def generate_caption(
     return output_text[0].strip()
 
 
-def write_metadata(args: argparse.Namespace, output_path: Path, total_sequences: int, prompt_text: str) -> None:
+def write_metadata(
+    args: argparse.Namespace,
+    output_path: Path,
+    collection: SequenceCollection,
+    prompt_text: str,
+) -> None:
     metadata_path = output_path.with_suffix(output_path.suffix + ".meta.json")
+    sequences = collection.sequences
+    selected_categories = sorted({record.category for record in sequences})
     metadata = {
         "script": "caption_co3d_sequences.py",
         "model_name": args.model_name,
-        "split": args.split,
-        "categories": sorted(args.categories or DEFAULT_SEEN_CATEGORIES),
+        "split": args.split if args.co3d_annotation_dir is not None else "subset",
+        "input_mode": "annotations" if args.co3d_annotation_dir is not None else "raw_scan",
+        "co3d_dir": str(args.co3d_dir) if args.co3d_dir is not None else None,
+        "co3d_annotation_dir": str(args.co3d_annotation_dir) if args.co3d_annotation_dir is not None else None,
+        "raw_co3d_root": str(args.raw_co3d_root) if args.raw_co3d_root is not None else None,
+        "categories": selected_categories,
         "min_num_images": args.min_num_images,
         "frames_per_sequence": args.frames_per_sequence,
         "max_sequences": args.max_sequences,
@@ -397,12 +521,14 @@ def write_metadata(args: argparse.Namespace, output_path: Path, total_sequences:
         "seed": args.seed,
         "use_category_hint": args.use_category_hint,
         "prompt": prompt_text,
-        "total_sequences_selected": total_sequences,
+        "total_sequences_selected": len(sequences),
+        "total_sequences_eligible_before_sampling": collection.total_eligible_sequences,
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
 def main() -> None:
+    overall_start_time = time.perf_counter()
     args = parse_args()
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -411,8 +537,9 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     prompt_template = load_prompt(args)
-    sequences = collect_sequences(args)
-    write_metadata(args, output_path, len(sequences), prompt_template)
+    collection = collect_sequences(args)
+    sequences = collection.sequences
+    write_metadata(args, output_path, collection, prompt_template)
 
     if not sequences:
         print("[info] No sequences selected. Nothing to caption.")
@@ -425,12 +552,18 @@ def main() -> None:
         else:
             completed_keys = read_existing_keys(output_path)
 
+    model_setup_start_time = time.perf_counter()
     model, processor, process_vision_info = load_qwen_components(args)
+    model_setup_elapsed = time.perf_counter() - model_setup_start_time
 
     mode = "a" if output_path.exists() and not args.overwrite else "w"
     with output_path.open(mode, encoding="utf-8") as handle:
         num_done = len(completed_keys)
         total = len(sequences)
+        total_eligible = collection.total_eligible_sequences
+        processed_this_run = 0
+        successful_this_run = 0
+        timed_sequence_seconds: list[float] = []
 
         for index, record in enumerate(sequences, start=1):
             if record.dataset_seq_name in completed_keys:
@@ -438,32 +571,36 @@ def main() -> None:
                     print(f"[resume] {index}/{total} scanned, {num_done} already completed")
                 continue
 
-            sampled_indices = evenly_spaced_indices(len(record.annos), args.frames_per_sequence)
-            sampled_annos = [record.annos[idx] for idx in sampled_indices]
+            sequence_start_time = time.perf_counter()
+            sampled_indices = evenly_spaced_indices(len(record.image_paths), args.frames_per_sequence)
             sampled_image_paths = [
-                (args.co3d_dir / anno["filepath"]).resolve()
-                for anno in sampled_annos
+                Path(record.image_paths[idx]).resolve()
+                for idx in sampled_indices
             ]
 
             missing_paths = [str(path) for path in sampled_image_paths if not path.exists()]
             if missing_paths:
                 print(f"[warn] Missing images for {record.dataset_seq_name}, skipping")
+                elapsed_seconds = time.perf_counter() - sequence_start_time
                 output_record = {
                     "dataset": "co3d",
                     "split": record.split,
                     "category": record.category,
                     "source_seq_name": record.source_seq_name,
                     "dataset_seq_name": record.dataset_seq_name,
-                    "num_frames_in_sequence": len(record.annos),
+                    "num_frames_in_sequence": len(record.image_paths),
                     "sampled_frame_indices": sampled_indices,
                     "sampled_image_paths": [str(path) for path in sampled_image_paths],
                     "caption": None,
                     "status": "missing_images",
                     "missing_image_paths": missing_paths,
+                    "elapsed_seconds": elapsed_seconds,
                     "model_name": args.model_name,
                 }
                 handle.write(json.dumps(output_record, ensure_ascii=True) + "\n")
                 handle.flush()
+                processed_this_run += 1
+                timed_sequence_seconds.append(elapsed_seconds)
                 continue
 
             prompt_text = build_prompt(
@@ -488,18 +625,23 @@ def main() -> None:
                 status = "error"
                 error_message = str(exc)
 
+            elapsed_seconds = time.perf_counter() - sequence_start_time
+            processed_this_run += 1
+            timed_sequence_seconds.append(elapsed_seconds)
+
             output_record = {
                 "dataset": "co3d",
                 "split": record.split,
                 "category": record.category,
                 "source_seq_name": record.source_seq_name,
                 "dataset_seq_name": record.dataset_seq_name,
-                "num_frames_in_sequence": len(record.annos),
+                "num_frames_in_sequence": len(record.image_paths),
                 "sampled_frame_indices": sampled_indices,
                 "sampled_image_paths": [str(path) for path in sampled_image_paths],
                 "caption": caption,
                 "status": status,
                 "error": error_message,
+                "elapsed_seconds": elapsed_seconds,
                 "model_name": args.model_name,
             }
             handle.write(json.dumps(output_record, ensure_ascii=True) + "\n")
@@ -507,12 +649,41 @@ def main() -> None:
 
             if status == "ok":
                 num_done += 1
+                successful_this_run += 1
 
             if index == 1 or index % 25 == 0:
+                avg_seconds = sum(timed_sequence_seconds) / len(timed_sequence_seconds) if timed_sequence_seconds else 0.0
                 print(
                     f"[progress] processed {index}/{total} sequences, "
-                    f"successful captions so far: {num_done}"
+                    f"successful captions so far: {num_done}, "
+                    f"avg seq time this run: {avg_seconds:.2f}s"
                 )
+
+    runtime_excluding_setup = sum(timed_sequence_seconds)
+    overall_elapsed = time.perf_counter() - overall_start_time
+    average_seconds = runtime_excluding_setup / len(timed_sequence_seconds) if timed_sequence_seconds else 0.0
+    estimated_selected_seconds = average_seconds * len(sequences)
+    estimated_full_dataset_seconds = average_seconds * total_eligible
+
+    print("[summary] Captioning run finished.")
+    print(f"[summary] Model setup time: {model_setup_elapsed:.2f}s ({format_duration(model_setup_elapsed)})")
+    print(
+        f"[summary] Processed this run: {processed_this_run} sequences "
+        f"({successful_this_run} successful, {processed_this_run - successful_this_run} non-ok)"
+    )
+    print(
+        f"[summary] Average time per processed sequence: {average_seconds:.2f}s "
+        f"({format_duration(average_seconds)})"
+    )
+    print(
+        f"[summary] Estimated time for current selected run ({len(sequences)} sequences): "
+        f"{estimated_selected_seconds:.2f}s ({format_duration(estimated_selected_seconds)})"
+    )
+    print(
+        f"[summary] Estimated time for full eligible dataset ({total_eligible} sequences): "
+        f"{estimated_full_dataset_seconds:.2f}s ({format_duration(estimated_full_dataset_seconds)})"
+    )
+    print(f"[summary] Total wall time including setup: {overall_elapsed:.2f}s ({format_duration(overall_elapsed)})")
 
 
 if __name__ == "__main__":
