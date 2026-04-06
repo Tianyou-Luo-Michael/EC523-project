@@ -188,8 +188,16 @@ def format_size_gb(size_bytes: int) -> str:
     return f"{size_bytes / (1024 ** 3):.2f} GB"
 
 
-def build_seq_name(category: str, sequence_dir_name: str) -> str:
-    return f"{category}/{sequence_dir_name}"
+def resolve_annotation_seq_name(
+    category: str,
+    sequence_dir_name: str,
+    category_annotation: Dict[str, list],
+) -> str | None:
+    candidates = [sequence_dir_name, f"{category}/{sequence_dir_name}"]
+    for candidate in candidates:
+        if candidate in category_annotation:
+            return candidate
+    return None
 
 
 def sync_existing_annotation_entries(
@@ -204,7 +212,13 @@ def sync_existing_annotation_entries(
         return recovered
 
     for sequence_dir in sorted(path for path in curated_category_dir.iterdir() if path.is_dir()):
-        seq_name = build_seq_name(category, sequence_dir.name)
+        seq_name = resolve_annotation_seq_name(
+            category=category,
+            sequence_dir_name=sequence_dir.name,
+            category_annotation=category_annotation,
+        )
+        if seq_name is None:
+            continue
         if seq_name in selected_entries:
             continue
         seq_data = category_annotation.get(seq_name)
@@ -230,7 +244,13 @@ def collect_available_candidates(
         images_dir = sequence_dir / "images"
         if not images_dir.is_dir():
             continue
-        seq_name = build_seq_name(category, sequence_dir.name)
+        seq_name = resolve_annotation_seq_name(
+            category=category,
+            sequence_dir_name=sequence_dir.name,
+            category_annotation=category_annotation,
+        )
+        if seq_name is None:
+            continue
         if seq_name in selected_entries:
             continue
         seq_data = category_annotation.get(seq_name)
