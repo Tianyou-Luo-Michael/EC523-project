@@ -120,7 +120,22 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Directory where filtered <category>_<split>.jgz files will be written.",
     )
-    parser.add_argument("--split", type=str, default="train", choices=["train", "test"])
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        choices=["train", "test"],
+        help="Output split name for the curated annotation files.",
+    )
+    parser.add_argument(
+        "--source-splits",
+        nargs="*",
+        default=None,
+        help=(
+            "Source annotation splits to union when selecting sequences. "
+            "Defaults to the output split only. Example: --source-splits train test"
+        ),
+    )
     parser.add_argument(
         "--categories",
         nargs="*",
@@ -174,6 +189,31 @@ def write_annotation_file(annotation_file: Path, payload: Dict[str, list]) -> No
     annotation_file.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(annotation_file, "wt", encoding="utf-8") as handle:
         json.dump(payload, handle)
+
+
+def load_category_annotation_union(
+    source_annotation_dir: Path,
+    category: str,
+    source_splits: list[str],
+) -> Dict[str, list]:
+    merged: Dict[str, list] = {}
+    for split_name in source_splits:
+        annotation_file = source_annotation_dir / f"{category}_{split_name}.jgz"
+        if not annotation_file.exists():
+            print(f"[warn] Missing source annotation file, skipping: {annotation_file}")
+            continue
+        payload = load_annotation_file(annotation_file)
+        duplicate_count = 0
+        for seq_name, seq_data in payload.items():
+            if seq_name in merged:
+                duplicate_count += 1
+            merged[seq_name] = seq_data
+        if duplicate_count:
+            print(
+                f"[warn] {category}: {duplicate_count} duplicate sequence ids encountered "
+                f"while merging split {split_name}."
+            )
+    return merged
 
 
 def directory_size_bytes(path: Path) -> int:
@@ -268,6 +308,7 @@ def copy_sequence_dir(source_dir: Path, dest_dir: Path) -> None:
 def main() -> None:
     args = parse_args()
     random.seed(args.seed)
+    source_splits = list(args.source_splits) if args.source_splits else [args.split]
 
     categories = sorted(args.categories or DEFAULT_SEEN_CATEGORIES)
     args.curated_co3d_root.mkdir(parents=True, exist_ok=True)
@@ -288,12 +329,14 @@ def main() -> None:
     total_added = 0
 
     for category in categories:
-        annotation_file = args.source_annotation_dir / f"{category}_{args.split}.jgz"
-        if not annotation_file.exists():
-            print(f"[warn] Missing source annotation file, skipping: {annotation_file}")
+        category_annotation = load_category_annotation_union(
+            source_annotation_dir=args.source_annotation_dir,
+            category=category,
+            source_splits=source_splits,
+        )
+        if not category_annotation:
+            print(f"[warn] No source annotations available for category {category}, skipping.")
             continue
-
-        category_annotation = load_annotation_file(annotation_file)
         curated_annotation_file = args.curated_annotation_dir / f"{category}_{args.split}.jgz"
         if curated_annotation_file.exists():
             selected_entries = load_annotation_file(curated_annotation_file)
@@ -414,6 +457,7 @@ def main() -> None:
         "curated_co3d_root": str(args.curated_co3d_root),
         "curated_annotation_dir": str(args.curated_annotation_dir),
         "split": args.split,
+        "source_splits": source_splits,
         "categories": categories,
         "target_sequences_per_category": args.target_sequences_per_category,
         "min_num_images": args.min_num_images,

@@ -36,6 +36,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional external <category>_<split>.jgz file for overlap analysis.",
     )
+    parser.add_argument(
+        "--annotation-files",
+        nargs="*",
+        default=None,
+        help="Optional list of annotation files to union for overlap analysis.",
+    )
     parser.add_argument("--min-num-images", type=int, default=24)
     parser.add_argument(
         "--show-samples",
@@ -55,6 +61,14 @@ def parse_args() -> argparse.Namespace:
 def load_annotation_file(annotation_file: Path) -> dict:
     with gzip.open(annotation_file, "rt", encoding="utf-8") as handle:
         return json.loads(handle.read())
+
+
+def load_annotation_union(annotation_files: list[Path]) -> dict:
+    merged = {}
+    for annotation_file in annotation_files:
+        payload = load_annotation_file(annotation_file)
+        merged.update(payload)
+    return merged
 
 
 def count_images(images_dir: Path) -> int:
@@ -106,8 +120,14 @@ def main() -> None:
         },
     }
 
+    annotation_files: list[Path] = []
+    if args.annotation_files:
+        annotation_files.extend(args.annotation_files)
     if args.annotation_file is not None:
-        annotation = load_annotation_file(args.annotation_file)
+        annotation_files.append(args.annotation_file)
+
+    if annotation_files:
+        annotation = load_annotation_union(annotation_files)
         annotation_keys = set(annotation.keys())
         chunk_sequence_names = [info["sequence_dir_name"] for info in sequence_infos]
 
@@ -120,7 +140,7 @@ def main() -> None:
 
         summary.update(
             {
-                "annotation_file": str(args.annotation_file.resolve()),
+                "annotation_files": [str(path.resolve()) for path in annotation_files],
                 "annotation_sequence_count": len(annotation),
                 "overlap_sequence_count": len(overlap_keys),
                 "overlap_eligible_count": len(overlap_eligible),
