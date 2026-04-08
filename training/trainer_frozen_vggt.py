@@ -23,6 +23,7 @@ from vggt.models.vggt import VGGT
 from vggt.models.frozen_vggt import FrozenVGGT
 from data.caption_manifest import load_caption_lookup_by_mode, get_caption_for_seq
 from train_utils.general import safe_makedirs, model_summary
+from train_utils.optimizer import OptimizerWrapper
 
 
 class FrozenVGGTTrainer(Trainer):
@@ -82,6 +83,25 @@ class FrozenVGGTTrainer(Trainer):
             self.caption_lookup = {}
 
         super().__init__(**kwargs)
+
+    # ── Override optimizer construction ───────────────────────────────────────
+    # The parent __init__ calls construct_optimizers(self.model, self.optim_conf)
+    # which passes ALL named_parameters (1.2 B) to AdamW.  We shadow it so the
+    # parent's call transparently lands here and builds over adapter params only.
+
+    @property
+    def optims(self):
+        return self._optims
+
+    @optims.setter
+    def optims(self, value):
+        # Called by the parent as:  self.optims = construct_optimizers(...)
+        # We discard the incoming value (built from all params) and replace it
+        # with our adapter-only optimizer, built once the model is on device.
+        if self.mode != "val":
+            self._optims = self._build_optims()
+        else:
+            self._optims = value
 
     # ── Component setup ───────────────────────────────────────────────────────
 
@@ -303,6 +323,27 @@ class FrozenVGGTTrainer(Trainer):
 
         self.steps[phase] += 1
         return loss_dict
+
+    # ── Optimizer (adapter params only) ──────────────────────────────────────
+
+    def _build_optims(self):
+        """
+        Build AdamW over adapter parameters only.
+
+        The base construct_optimizer passes ALL model.named_parameters() to
+        AdamW, which would allocate momentum buffers for 1.2 B frozen VGGT
+        params — wasting ~2.4 GB of GPU memory for state that is never used.
+        Here we filter to requires_grad=True params before constructing the
+        optimizer, then wrap in the same OptimizerWrapper the rest of the
+        trainer expects.
+        """
+        import hydra
+        trainable_params = [
+            p for p in self.model.parameters() if p.requires_grad
+        ]
+        assert trainable_params, "No trainable parameters found — adapter may not be built yet."
+        optimizer = hydra.utils.instantiate(self.optim_conf.optimizer, trainable_params)
+        return [OptimizerWrapper(optimizer)]
 
     # ── Checkpoint ────────────────────────────────────────────────────────────
 
