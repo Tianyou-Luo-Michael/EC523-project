@@ -343,7 +343,12 @@ class FrozenVGGTTrainer(Trainer):
         ]
         assert trainable_params, "No trainable parameters found — adapter may not be built yet."
         optimizer = hydra.utils.instantiate(self.optim_conf.optimizer, trainable_params)
-        return [OptimizerWrapper(optimizer)]
+        # schedulers must be a list of dicts (one per param group), not None.
+        # The parent's train_epoch does `for option in optim.schedulers[j]` without
+        # guarding for None, so passing None would crash with TypeError.
+        # Empty dicts mean "no scheduler" — the loop body simply never executes.
+        schedulers = [{} for _ in optimizer.param_groups]
+        return [OptimizerWrapper(optimizer, schedulers)]
 
     # ── Checkpoint ────────────────────────────────────────────────────────────
 
