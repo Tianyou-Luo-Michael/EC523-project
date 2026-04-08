@@ -267,7 +267,21 @@ class FrozenVGGTTrainer(Trainer):
         predictions = model(images=images, captions=captions)
 
         # ── (b) Multi-task loss on correct predictions ─────────────────────
-        loss_dict = self.loss(predictions, batch)
+        # Detach confidence tensors before the loss call so the adapter is
+        # trained only via regression accuracy (depth/camera errors), not by
+        # exploiting the confidence term.  Without this, the adapter learns to
+        # push frozen-head tokens toward high-confidence directions, creating a
+        # runaway: higher conf → more negative loss_conf_depth → gradient pushes
+        # conf higher → gradient norm blows up → NaN.
+        # Detaching conf makes loss_conf_depth = γ·err·c_detach - α·log(c_detach),
+        # which is a per-pixel-weighted regression loss (weight = c_detach).
+        # The logged conf values are still the live (non-detached) outputs.
+        loss_predictions = {**predictions}
+        if "depth_conf" in loss_predictions:
+            loss_predictions["depth_conf"] = loss_predictions["depth_conf"].detach()
+        if "world_points_conf" in loss_predictions:
+            loss_predictions["world_points_conf"] = loss_predictions["world_points_conf"].detach()
+        loss_dict = self.loss(loss_predictions, batch)
 
         # ── (c) Margin loss (training + captions only) ─────────────────────
         if phase == "train" and captions is not None and "depth" in predictions:
@@ -289,14 +303,20 @@ class FrozenVGGTTrainer(Trainer):
             )
             gt_depth = batch["depths"]
 
-            # err_wrong is detached — comparison target only, no gradient.
-            # err_correct_live carries gradient → adapter params.
-            err_wrong = (depth_wrong[valid] - gt_depth[valid]).abs().detach()
-            err_correct_live = (depth_correct[valid] - gt_depth[valid]).abs()
+            n_valid = valid.sum().item()
+            if n_valid == 0:
+                # No valid depth pixels in this batch — skip margin loss entirely
+                # rather than letting .mean() on an empty tensor produce nan.
+                loss_margin = depth_correct.sum() * 0.0   # zero, keeps grad_fn alive
+            else:
+                # err_wrong is detached — comparison target only, no gradient.
+                # err_correct_live carries gradient → adapter params.
+                err_wrong = (depth_wrong[valid] - gt_depth[valid]).abs().detach()
+                err_correct_live = (depth_correct[valid] - gt_depth[valid]).abs()
 
-            loss_margin = torch.nn.functional.relu(
-                err_correct_live - err_wrong + self.margin
-            ).mean()
+                loss_margin = torch.nn.functional.relu(
+                    err_correct_live - err_wrong + self.margin
+                ).mean()
 
             loss_dict["loss_margin"] = loss_margin
             loss_dict["objective"] = (

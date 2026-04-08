@@ -70,7 +70,7 @@ print(f"Gate at init: {model.adapter.gate.item():.4f}")   # must be 0.0000
 # Only adapter params — optimizer never touches frozen VGGT or CLIP weights
 optimizer = AdamW(
     model.adapter.parameters(),
-    lr=1e-4,
+    lr=3e-5,          # 1e-4 caused grad norms 8-32x clip threshold → NaN
     weight_decay=1e-2,
     betas=(0.9, 0.999),
 )
