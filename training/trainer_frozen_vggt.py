@@ -21,7 +21,7 @@ from hydra.utils import instantiate
 from trainer import Trainer
 from vggt.models.vggt import VGGT
 from vggt.models.frozen_vggt import FrozenVGGT
-from data.caption_manifest import load_caption_lookup, get_caption_for_seq
+from data.caption_manifest import load_caption_lookup_by_mode, get_caption_for_seq
 from train_utils.general import safe_makedirs, model_summary
 
 
@@ -49,6 +49,7 @@ class FrozenVGGTTrainer(Trainer):
         vggt_model_name: str = "facebook/VGGT-1B",
         adapter_dim: int = 512,
         caption_manifest_path: Optional[str] = None,
+        caption_mode: str = "concise",   # "concise" or "descriptive"
         margin: float = 0.05,
         margin_loss_weight: float = 0.5,
         enable_camera: bool = True,
@@ -70,9 +71,12 @@ class FrozenVGGTTrainer(Trainer):
 
         # Caption lookup: seq_name -> caption string
         if caption_manifest_path is not None:
-            self.caption_lookup = load_caption_lookup(caption_manifest_path)
+            self.caption_lookup = load_caption_lookup_by_mode(
+                caption_manifest_path, mode=caption_mode
+            )
             logging.info(
-                f"Loaded {len(self.caption_lookup)} captions from {caption_manifest_path}"
+                f"Loaded {len(self.caption_lookup)} captions "
+                f"({caption_mode}) from {caption_manifest_path}"
             )
         else:
             self.caption_lookup = {}

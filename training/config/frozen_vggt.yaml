@@ -29,6 +29,7 @@ clip_model_name: "ViT-B/32"          # "ViT-L/14" supported; d_text auto-set to 
 vggt_model_name: "facebook/VGGT-1B"  # HuggingFace model ID
 adapter_dim: 512                      # bottleneck dim of CrossAttentionAdapter
 caption_manifest_path: null           # path/to/captions.jsonl  (null = no captions)
+caption_mode: "concise"               # "concise" or "descriptive"
 margin: 0.05                          # depth margin for caption margin loss
 margin_loss_weight: 0.5               # weight on the margin loss term
 
