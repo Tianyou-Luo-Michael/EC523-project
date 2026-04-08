@@ -188,9 +188,14 @@ class FrozenVGGTTrainer(Trainer):
         Backbone (aggregator + heads) in eval mode — suppresses dropout and
         keeps BatchNorm statistics frozen, exactly as at inference.
         Only the adapter is put in train mode so its dropout / BN (if any) behave.
+
+        NOTE: calls nn.Module.train(model, False) directly instead of
+        self.model.eval() because nn.Module.eval() is implemented as
+        self.train(False), which would hit any instance-level patch on .train
+        and cause infinite recursion.
         """
-        self.model.eval()
-        self._inner_model().adapter.train()
+        nn.Module.train(self.model, False)   # entire model → eval mode
+        self._inner_model().adapter.train()  # adapter only → train mode
 
     # ── Per-step forward + loss ───────────────────────────────────────────────
 
@@ -298,33 +303,6 @@ class FrozenVGGTTrainer(Trainer):
 
         self.steps[phase] += 1
         return loss_dict
-
-    # ── Training epoch ────────────────────────────────────────────────────────
-
-    def train_epoch(self, train_loader):
-        """
-        Training epoch with frozen-backbone mode enforced.
-
-        The parent implementation calls self.model.train() once at the top.
-        We override to intercept that call and redirect it to
-        _set_frozen_train_mode() so the backbone stays in eval throughout.
-        """
-        # Patch model.train on this instance so the parent's self.model.train()
-        # call lands in _set_frozen_train_mode instead of nn.Module.train.
-        _original_train = self.model.train
-
-        def _frozen_train_mode(mode: bool = True):
-            # Ignore the mode argument; always enforce frozen-backbone mode.
-            self._set_frozen_train_mode()
-
-        self.model.train = _frozen_train_mode
-        try:
-            result = super().train_epoch(train_loader)
-        finally:
-            # Restore original method regardless of exceptions.
-            self.model.train = _original_train
-
-        return result
 
     # ── Checkpoint ────────────────────────────────────────────────────────────
 
