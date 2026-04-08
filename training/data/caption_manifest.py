@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Dict, Iterator, Optional
+from typing import Dict, Iterator, Literal, Optional
 
 
 def iter_caption_records(manifest_path: str | Path) -> Iterator[dict]:
@@ -42,15 +42,42 @@ def load_caption_records(
 def load_caption_lookup(
     manifest_path: str | Path,
     key_field: str = "dataset_seq_name",
-    value_field: str = "caption",
+    value_field: str = "caption_concise",
 ) -> Dict[str, str]:
-    """Load a simple ``seq_name -> caption`` lookup."""
+    """Load a simple ``seq_name -> caption`` lookup.
+
+    ``value_field`` should be one of:
+        ``"caption_concise"``      — short one-sentence caption (default)
+        ``"caption_descriptive"``  — longer, multi-sentence caption
+    """
     records = load_caption_records(manifest_path=manifest_path, key_field=key_field)
     return {
         key: record[value_field]
         for key, record in records.items()
         if value_field in record
     }
+
+
+CaptionMode = Literal["concise", "descriptive"]
+
+_CAPTION_FIELD: Dict[str, str] = {
+    "concise":     "caption_concise",
+    "descriptive": "caption_descriptive",
+}
+
+
+def load_caption_lookup_by_mode(
+    manifest_path: str | Path,
+    mode: CaptionMode = "concise",
+    key_field: str = "dataset_seq_name",
+) -> Dict[str, str]:
+    """Convenience wrapper — select caption field by ``mode`` name."""
+    field = _CAPTION_FIELD[mode]
+    return load_caption_lookup(
+        manifest_path=manifest_path,
+        key_field=key_field,
+        value_field=field,
+    )
 
 
 def get_caption_for_seq(
