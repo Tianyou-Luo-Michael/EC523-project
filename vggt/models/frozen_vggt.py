@@ -7,32 +7,18 @@ from vggt.models.adapter import CrossAttentionAdapter
 
 class FrozenVGGT(VGGT):
     """
-    Frozen VGGT + trainable cross-attention adapter.
+    VGGT with all parameters frozen + a trainable CrossAttentionAdapter.
 
-    Implements the modification described for vggt/models/vggt.py:
+    CLIP is stored via object.__setattr__ to bypass nn.Module registration,
+    keeping its ~400M params out of state_dict() and parameters().
+    Only the adapter (~3.4M params) is trainable.
 
-        (a) Line 61: aggregator produces aggregated_tokens_list as normal
-        (b) Right after line 61: CLIP encodes captions into 77 token hidden states
-        (c) aggregated_tokens_list[-1] + CLIP tokens passed through cross-attn adapter
-        (d) Adapter output replaces aggregated_tokens_list[-1] before prediction heads
+    Gradient flow: loss → heads → conditioned_tokens[-1] → delta → adapter
+                                                           ↛ VGGT (frozen)
 
-    Training memory:
-        VGGT aggregator (48 blocks, 1.2B params) : frozen, no_grad, no activations stored
-        CLIP encoder (~400M params)               : frozen, no_grad, excluded from state_dict
-        CrossAttentionAdapter (~3.4M params)      : only trainable component
-
-    Gradient flow:
-        loss → head ops → conditioned_tokens[-1] → delta → adapter.params  (correct)
-                                                  ↛ VGGT aggregator         (detached)
-
-    Dtype contract enforced under autocast(enabled=False):
-        VGGT tokens (bfloat16) → .float() → float32  |
-        CLIP tokens  (float16) → .float() → float32  |--> adapter --> float32
-        delta                  →           float32   |
-        ALL list entries       → .float() → float32 --> heads (float32)
-
-        DPT head is a feature pyramid reading all list entries — every entry
-        must be float32 before the heads see them, not just the last one.
+    All tokens are cast to float32 before the adapter and heads — the DPT
+    head reads every entry in aggregated_tokens_list as a feature pyramid,
+    so dtype must be consistent across the entire list.
     """
 
     def __init__(
@@ -42,7 +28,7 @@ class FrozenVGGT(VGGT):
         patch_size: int = 14,
         embed_dim: int = 1024,
         adapter_dim: int = 512,
-        d_text: int = 512,        # 512 for ViT-B/32, 768 for ViT-L/14
+        d_text: int = 512,      # 512 for ViT-B/32, 768 for ViT-L/14
         **vggt_kwargs,
     ):
         super().__init__(
@@ -52,59 +38,40 @@ class FrozenVGGT(VGGT):
             **vggt_kwargs,
         )
 
-        # Store CLIP bypassing nn.Module's __setattr__ so it is NOT registered
-        # as a submodule. This excludes CLIP's ~400M params from:
-        #   - self.parameters()  → param count shows only VGGT + adapter
-        #   - self.state_dict()  → checkpoint does not contain CLIP weights
-        #   - model.to(device)   → caller must move CLIP to device before passing in
+        # Bypass nn.Module.__setattr__
         object.__setattr__(self, '_clip_model', clip_model)
 
-        # Freeze all inherited VGGT parameters
+        # Freeze VGGT and CLIP
         for p in self.parameters():
             p.requires_grad_(False)
-
-        # Freeze CLIP parameters
         for p in self._clip_model.parameters():
             p.requires_grad_(False)
 
-        # Adapter d_model must match what DPT/camera heads receive.
-        # Heads constructed with dim_in = 2 * embed_dim = 2048.
-        d_model = embed_dim * 2
-
-        # Adapter — only trainable component.
-        # Registered normally so it appears in self.parameters() and state_dict().
+        # d_model matches heads
         self.adapter = CrossAttentionAdapter(
-            d_model=d_model,
+            d_model=embed_dim * 2,
             d_text=d_text,
             adapter_dim=adapter_dim,
         )
-        # Re-enable grad on adapter after the global VGGT freeze above
         for p in self.adapter.parameters():
             p.requires_grad_(True)
 
     @torch.no_grad()
     def _encode_captions(self, captions: list[str], device) -> torch.Tensor:
         """
-        Encode captions as token-level CLIP hidden states [B, 77, d_text].
+        Returns token-level CLIP hidden states [B, 77, d_text] in float16.
 
-        Returns CLIP's native dtype (float16 on GPU).
-        Caller casts to float32 at point of use.
-
-        Token-level rather than pooled embedding:
-            Pooled → 1 KV token → softmax over 1 element always = 1
-            → attention output identical for all queries → degenerates to
-            a global bias, not real cross-attention.
-            77 tokens → each VGGT spatial token attends differently to
-            different words in the caption.
+        Token-level (not pooled) so each VGGT spatial token can attend
+        differently to different words — pooled embeddings degenerate to
+        a global bias since softmax over 1 token always equals 1.
         """
         text = clip.tokenize(captions, truncate=True).to(device)
         x = self._clip_model.token_embedding(text).type(self._clip_model.dtype)
         x = x + self._clip_model.positional_embedding.type(self._clip_model.dtype)
-        x = x.permute(1, 0, 2)                    # NLD → LND
+        x = x.permute(1, 0, 2)
         x = self._clip_model.transformer(x)
-        x = x.permute(1, 0, 2)                    # LND → NLD
-        x = self._clip_model.ln_final(x)           # [B, 77, d_text] float16
-        return x
+        x = x.permute(1, 0, 2)
+        return self._clip_model.ln_final(x)
 
     def forward(
         self,
@@ -117,58 +84,42 @@ class FrozenVGGT(VGGT):
             images       : [S, 3, H, W] or [B, S, 3, H, W], range [0, 1]
             query_points : [N, 2] or [B, N, 2] — optional, for tracking
             captions     : list of B strings — optional, enables adapter.
-                           If None, behaviour is identical to vanilla VGGT.
-
+                           If None, runs as vanilla VGGT.
         Returns:
-            Same dict as VGGT.forward() — fully backward-compatible.
+            Same dict as VGGT.forward().
         """
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        # ── (a) Aggregator — vggt.py line 61 ────────────────────────────────
-        # Frozen: no_grad suppresses activation storage across all 48 blocks.
+        # Frozen aggregator
         with torch.no_grad():
             aggregated_tokens_list, patch_start_idx = self.aggregator(images)
 
-        # ── (b) + (c) CLIP encoding → cross-attention adapter ────────────────
-        # Inserted immediately after line 61, as specified.
-        # Skipped entirely when captions=None — vanilla VGGT behaviour preserved.
         if captions is not None:
             clip_seq = self._encode_captions(captions, images.device)
 
-            # Hard float32 context — overrides any outer bfloat16 autocast.
-            # Matches the prediction heads which also run under autocast(enabled=False).
+            # Force float32
             with torch.cuda.amp.autocast(enabled=False):
-
-                # Cast ALL list entries to float32.
-                # DPT head is a feature pyramid reading every entry in the list.
-                # Mixing bfloat16 entries with one float32 entry causes silent
-                # precision issues or dtype errors inside the DPT head.
                 tokens_f32   = [t.float() for t in aggregated_tokens_list]
-                clip_seq_f32 = clip_seq.float()                # float16 → float32
+                clip_seq_f32 = clip_seq.float()
 
-               # (c) Cross-attention adapter
+                # Expand CLIP tokens across frames
                 B, S, N, D = tokens_f32[-1].shape
                 clip_seq_exp = clip_seq_f32.unsqueeze(1).expand(-1, S, -1, -1).reshape(B * S, 77, -1)
 
                 delta = self.adapter(
                     tokens_f32[-1].reshape(B * S, N, D),
                     clip_seq_exp,
-                )
-                delta = delta.reshape(B, S, N, D)
+                ).reshape(B, S, N, D)
 
-                conditioned_final = tokens_f32[-1] + delta
+                # Replace final token list entry with adapter conditioned output
+                aggregated_tokens_list = tokens_f32[:-1] + [tokens_f32[-1] + delta]
 
-                # (d) Replace final entry — adapter output flows to prediction heads
-                aggregated_tokens_list = tokens_f32[:-1] + [conditioned_final]
-
-        # ── (d) Prediction heads — rest of VGGT unchanged ────────────────────
-        # Head params frozen (requires_grad=False) but operations are
-        # differentiable — grad flows through them to delta → adapter.params.
         predictions = {}
 
+        # Heads are frozen but differentiable
         with torch.cuda.amp.autocast(enabled=False):
             if self.camera_head is not None:
                 pose_enc_list = self.camera_head(aggregated_tokens_list)
