@@ -81,6 +81,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--preserve-existing-split-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional existing split annotation directory whose current train/test "
+            "assignments should be preserved for any sequences that are already present. "
+            "Newly added sequences will be assigned around those fixed memberships."
+        ),
+    )
+    parser.add_argument(
         "--input-caption-manifest",
         type=Path,
         default=None,
@@ -338,6 +348,33 @@ def load_eligible_source_sets(
     return eligible_train, eligible_test
 
 
+def load_existing_split_sets(
+    split_annotation_dir: Path | None,
+    category: str,
+) -> tuple[set[str], set[str]]:
+    existing_train: set[str] = set()
+    existing_test: set[str] = set()
+    if split_annotation_dir is None:
+        return existing_train, existing_test
+
+    train_file = split_annotation_dir / f"{category}_train.jgz"
+    test_file = split_annotation_dir / f"{category}_test.jgz"
+
+    if train_file.exists():
+        existing_train = set(load_annotation_file(train_file).keys())
+    if test_file.exists():
+        existing_test = set(load_annotation_file(test_file).keys())
+
+    overlap = existing_train & existing_test
+    if overlap:
+        raise ValueError(
+            f"Existing split directory contains overlapping train/test assignments for "
+            f"{category}: {sorted(list(overlap))[:10]}"
+        )
+
+    return existing_train, existing_test
+
+
 def replace_path_component(path: Path, old_component: str, new_component: str) -> Path:
     parts = list(path.parts)
     try:
@@ -454,6 +491,66 @@ def assign_category_splits(
     return sorted(train_selected), sorted(test_selected)
 
 
+def assign_category_splits_preserving_existing(
+    seq_names: list[str],
+    original_train: set[str],
+    original_test: set[str],
+    desired_train_count: int,
+    rng: random.Random,
+    preserved_train: set[str],
+    preserved_test: set[str],
+) -> tuple[list[str], list[str]]:
+    seq_set = set(seq_names)
+    fixed_train = sorted(seq_set & preserved_train)
+    fixed_test = sorted(seq_set & preserved_test)
+
+    overlap = set(fixed_train) & set(fixed_test)
+    if overlap:
+        raise ValueError(
+            f"Preserved split assignments overlap for sequences: {sorted(list(overlap))[:10]}"
+        )
+
+    unassigned = sorted(seq_set - set(fixed_train) - set(fixed_test))
+    if not unassigned:
+        return fixed_train, fixed_test
+
+    desired_test_count = len(seq_names) - desired_train_count
+    train_needed = max(0, desired_train_count - len(fixed_train))
+    test_needed = max(0, desired_test_count - len(fixed_test))
+
+    # If the preserved assignments already overshoot one side of the desired ratio,
+    # we keep them fixed and allocate all remaining sequences to the other side.
+    if train_needed + test_needed < len(unassigned):
+        remaining = len(unassigned) - train_needed - test_needed
+        train_slack = desired_train_count - len(fixed_train)
+        test_slack = desired_test_count - len(fixed_test)
+        if train_slack > test_slack:
+            train_needed += remaining
+        else:
+            test_needed += remaining
+
+    new_train, new_test = assign_category_splits(
+        seq_names=unassigned,
+        original_train=original_train,
+        original_test=original_test,
+        desired_train_count=train_needed,
+        rng=rng,
+    )
+
+    final_train = sorted(set(fixed_train) | set(new_train))
+    final_test = sorted(set(fixed_test) | set(new_test))
+
+    if len(final_train) + len(final_test) != len(seq_names):
+        raise RuntimeError(
+            "Failed to preserve existing split assignments while assigning all sequences."
+        )
+
+    if set(final_train) & set(final_test):
+        raise RuntimeError("Final train/test assignments overlap after preserving splits.")
+
+    return final_train, final_test
+
+
 def rewrite_sampled_image_paths(
     record: dict,
     co3d_root: Path,
@@ -551,19 +648,42 @@ def main() -> None:
             category=category,
             min_num_images=args.min_num_images,
         )
+        preserved_train, preserved_test = load_existing_split_sets(
+            split_annotation_dir=args.preserve_existing_split_dir,
+            category=category,
+        )
+
+        unavailable_preserved = (preserved_train | preserved_test) - set(available_seq_names)
+        if unavailable_preserved:
+            print(
+                f"[warn] {category}: {len(unavailable_preserved)} preserved split assignments "
+                "refer to sequences no longer available and will be ignored."
+            )
+
         desired_train_count, train_ratio = compute_desired_train_count(
             available_count=len(available_seq_names),
             original_train_count=len(original_train),
             original_test_count=len(original_test),
             default_train_ratio=args.default_train_ratio,
         )
-        train_seq_names, test_seq_names = assign_category_splits(
-            seq_names=available_seq_names,
-            original_train=original_train,
-            original_test=original_test,
-            desired_train_count=desired_train_count,
-            rng=rng,
-        )
+        if args.preserve_existing_split_dir is not None:
+            train_seq_names, test_seq_names = assign_category_splits_preserving_existing(
+                seq_names=available_seq_names,
+                original_train=original_train,
+                original_test=original_test,
+                desired_train_count=desired_train_count,
+                rng=rng,
+                preserved_train=preserved_train,
+                preserved_test=preserved_test,
+            )
+        else:
+            train_seq_names, test_seq_names = assign_category_splits(
+                seq_names=available_seq_names,
+                original_train=original_train,
+                original_test=original_test,
+                desired_train_count=desired_train_count,
+                rng=rng,
+            )
 
         train_payload = {seq_name: valid_entries[seq_name] for seq_name in train_seq_names}
         test_payload = {seq_name: valid_entries[seq_name] for seq_name in test_seq_names}
@@ -598,7 +718,9 @@ def main() -> None:
         )
         print(
             f"[split] {category}: {len(train_seq_names)} train / {len(test_seq_names)} test "
-            f"(ratio {train_ratio:.3f}, invalid dropped {len(invalid_reasons)})"
+            f"(ratio {train_ratio:.3f}, invalid dropped {len(invalid_reasons)}, "
+            f"preserved train/test {len(set(available_seq_names) & preserved_train)}/"
+            f"{len(set(available_seq_names) & preserved_test)})"
         )
 
     missing_caption_keys: list[str] = []
@@ -665,6 +787,11 @@ def main() -> None:
         "input_annotation_dir": str(args.input_annotation_dir),
         "output_annotation_dir": str(args.output_annotation_dir),
         "source_annotation_dir": str(args.source_annotation_dir),
+        "preserve_existing_split_dir": (
+            str(args.preserve_existing_split_dir)
+            if args.preserve_existing_split_dir is not None
+            else None
+        ),
         "input_splits": list(args.input_splits),
         "categories": categories,
         "min_num_images": args.min_num_images,
