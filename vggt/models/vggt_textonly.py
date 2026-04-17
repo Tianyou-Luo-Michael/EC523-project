@@ -295,42 +295,67 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
         device = input_ids.device
 
         # ------------------------------------------------------------------
+        # 0. Normalise the images tensor and derive spatial / sequence info.
+        #    This is done now (before the DPT head calls) so that:
+        #      (a) The DPT / camera heads use the real image H×W as their
+        #          output-resolution reference, avoiding the 518×518 dummy
+        #          mismatch when input images are non-square (e.g. 476×518).
+        #      (b) Predictions are expanded along S so their shape matches
+        #          the GT tensors (which have S = number of input frames).
+        # ------------------------------------------------------------------
+        if images is not None:
+            if images.dim() == 4:
+                images = images.unsqueeze(0)  # [S, C, H, W] → [1, S, C, H, W]
+            S = images.shape[1]
+            # First frame only: gives DPT head the correct H, W reference.
+            ref_images = images[:, :1].contiguous()  # [B, 1, 3, H, W]
+        else:
+            S = 1
+            ref_images = self._dummy_images(B, device)  # [B, 1, 3, 518, 518]
+
+        # ------------------------------------------------------------------
         # 1. Text encoding (student) — always executed
         # ------------------------------------------------------------------
         text_tokens_list, patch_start_idx = self.text_encoder(
             input_ids, attention_mask
         )
 
-        dummy_images = self._dummy_images(B, device)
-
         # ------------------------------------------------------------------
         # 2. Downstream predictions from text tokens
+        #    Heads produce outputs with the virtual S=1 sequence dimension.
+        #    We immediately expand to the real S so downstream losses can
+        #    index predictions and GT with the same mask shape.
         # ------------------------------------------------------------------
         predictions: dict = {}
 
         with torch.amp.autocast('cuda', enabled=False):
             if self.camera_head is not None:
                 pose_enc_list = self.camera_head(text_tokens_list)
-                predictions["pose_enc"] = pose_enc_list[-1]
-                predictions["pose_enc_list"] = pose_enc_list
+                # pose_enc: [B, 1, 9] → [B, S, 9]
+                predictions["pose_enc"] = pose_enc_list[-1].expand(-1, S, -1)
+                predictions["pose_enc_list"] = [
+                    t.expand(-1, S, -1) for t in pose_enc_list
+                ]
 
             if self.depth_head is not None:
                 depth, depth_conf = self.depth_head(
                     text_tokens_list,
-                    images=dummy_images,
+                    images=ref_images,
                     patch_start_idx=patch_start_idx,
                 )
-                predictions["depth"] = depth
-                predictions["depth_conf"] = depth_conf
+                # depth: [B, 1, H, W, 1] → [B, S, H, W, 1]
+                predictions["depth"] = depth.expand(-1, S, -1, -1, -1)
+                # depth_conf: [B, 1, H, W] → [B, S, H, W]
+                predictions["depth_conf"] = depth_conf.expand(-1, S, -1, -1)
 
             if self.point_head is not None:
                 pts3d, pts3d_conf = self.point_head(
                     text_tokens_list,
-                    images=dummy_images,
+                    images=ref_images,
                     patch_start_idx=patch_start_idx,
                 )
-                predictions["world_points"] = pts3d
-                predictions["world_points_conf"] = pts3d_conf
+                predictions["world_points"] = pts3d.expand(-1, S, -1, -1, -1)
+                predictions["world_points_conf"] = pts3d_conf.expand(-1, S, -1, -1)
 
         predictions["text_tokens_list"] = text_tokens_list
 
@@ -338,9 +363,6 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
         # 3. Image encoding (teacher) — only during training with images
         # ------------------------------------------------------------------
         if self.training and images is not None:
-            if images.dim() == 4:
-                images = images.unsqueeze(0)  # [S, C, H, W] → [B, S, C, H, W]
-
             # Run frozen aggregator without gradient tracking
             with torch.no_grad():
                 image_tokens_list, _ = self.aggregator(images)
@@ -355,7 +377,7 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
             predictions["image_tokens_list"] = image_tokens_list
 
         if not self.training:
-            predictions["images"] = dummy_images
+            predictions["images"] = ref_images
 
         return predictions
 
