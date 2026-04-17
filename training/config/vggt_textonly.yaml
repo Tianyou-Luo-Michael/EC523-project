@@ -57,8 +57,8 @@ freeze_heads_steps: 500
 
 # Caption manifest: path to a JSONL file with {"seq_name": ..., "concise": ..., "descriptive": ...}.
 # Set to null if your dataset provides captions directly in the batch (batch["captions"]).
-caption_manifest_path: null
-caption_mode: "concise"    # "concise" or "descriptive"
+caption_manifest_path: /projectnb/ec523/projects/proj_vggt/dataset/co3d_curated_captions_train.jsonl
+caption_mode: "descriptive"    # "concise" or "descriptive"
 
 # Head enable flags
 enable_camera: true
@@ -87,8 +87,8 @@ data:
       dataset_configs:
         - _target_: data.datasets.co3d.Co3dDataset
           split: train
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+          CO3D_DIR: /projectnb/ec523/projects/proj_vggt/dataset/co3d_curated
+          CO3D_ANNOTATION_DIR: /projectnb/ec523/projects/proj_vggt/dataset/co3d_curated_anno_split
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
     num_workers: ${num_workers}
@@ -102,8 +102,8 @@ data:
       dataset_configs:
         - _target_: data.datasets.co3d.Co3dDataset
           split: test
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+          CO3D_DIR: /projectnb/ec523/projects/proj_vggt/dataset/co3d_curated
+          CO3D_ANNOTATION_DIR: /projectnb/ec523/projects/proj_vggt/dataset/co3d_curated_anno_split
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging:
@@ -210,6 +210,7 @@ distributed:
   backend: nccl
   comms_dtype: null
   find_unused_parameters: False   # all trainable params are used in every forward pass
+
   timeout_mins: 30
   gradient_as_bucket_view: True
   bucket_cap_mb: 25
