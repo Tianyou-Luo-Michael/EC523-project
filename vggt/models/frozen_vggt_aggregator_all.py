@@ -5,7 +5,7 @@ from vggt.models.vggt import VGGT
 from vggt.models.adapter import CrossAttentionAdapter
 
 
-class FrozenVGGT(VGGT):
+class FrozenVGGT_Aggregator_0(VGGT):
     """
     VGGT with all parameters frozen + a trainable CrossAttentionAdapter.
 
@@ -100,22 +100,35 @@ class FrozenVGGT(VGGT):
         if captions is not None:
             clip_seq = self._encode_captions(captions, images.device)
 
-            # Force float32
             with torch.cuda.amp.autocast(enabled=False):
-                tokens_f32   = [t.float() for t in aggregated_tokens_list]
+                tokens_f32 = [t.float() for t in aggregated_tokens_list]
                 clip_seq_f32 = clip_seq.float()
 
-                # Expand CLIP tokens across frames
-                B, S, N, D = tokens_f32[-1].shape
-                clip_seq_exp = clip_seq_f32.unsqueeze(1).expand(-1, S, -1, -1).reshape(B * S, 77, -1)
+                target_indices = [0, 12, 23]
 
-                delta = self.adapter(
-                    tokens_f32[-1].reshape(B * S, N, D),
-                    clip_seq_exp,
-                ).reshape(B, S, N, D)
+                for target_idx in target_indices:
+                    if target_idx >= len(tokens_f32):
+                        raise IndexError(
+                            f"target_idx={target_idx} is out of range for "
+                            f"aggregated_tokens_list of length {len(tokens_f32)}"
+                        )
 
-                # Replace final token list entry with adapter conditioned output
-                aggregated_tokens_list = tokens_f32[:-1] + [tokens_f32[-1] + delta]
+                    B, S, N, D = tokens_f32[target_idx].shape
+                    clip_seq_exp = (
+                        clip_seq_f32
+                        .unsqueeze(1)
+                        .expand(-1, S, -1, -1)
+                        .reshape(B * S, 77, -1)
+                    )
+
+                    delta = self.adapter(
+                        tokens_f32[target_idx].reshape(B * S, N, D),
+                        clip_seq_exp,
+                    ).reshape(B, S, N, D)
+
+                    tokens_f32[target_idx] = tokens_f32[target_idx] + delta
+
+                aggregated_tokens_list = tokens_f32
 
         predictions = {}
 

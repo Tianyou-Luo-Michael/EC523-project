@@ -173,7 +173,18 @@ class FrozenVGGTTrainer(Trainer):
                 f"VGGT weights loaded. Missing (adapter expected): {missing}"
             )
             if unexpected:
-                logging.warning(f"Unexpected keys: {unexpected}")
+                # Unexpected keys are disabled heads (point_head/track_head) whose
+                # weights exist in the vanilla VGGT probe but not in FrozenVGGT
+                # because enable_point=False / enable_track=False.  This is normal.
+                disabled_prefixes = ("point_head.", "track_head.")
+                real_unexpected = [k for k in unexpected if not k.startswith(disabled_prefixes)]
+                if real_unexpected:
+                    logging.warning(f"Truly unexpected keys: {real_unexpected}")
+                else:
+                    logging.info(
+                        f"Skipped {len(unexpected)} disabled-head keys "
+                        f"(point_head/track_head) — expected when enable_point/track=False."
+                    )
 
         del _probe, probe_state
         torch.cuda.empty_cache()
