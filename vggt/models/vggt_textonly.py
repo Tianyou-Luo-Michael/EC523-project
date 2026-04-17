@@ -296,22 +296,21 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
 
         # ------------------------------------------------------------------
         # 0. Normalise the images tensor and derive spatial / sequence info.
-        #    This is done now (before the DPT head calls) so that:
-        #      (a) The DPT / camera heads use the real image H×W as their
-        #          output-resolution reference, avoiding the 518×518 dummy
-        #          mismatch when input images are non-square (e.g. 476×518).
-        #      (b) Predictions are expanded along S so their shape matches
-        #          the GT tensors (which have S = number of input frames).
+        #    The DPT heads must always receive dummy images whose spatial
+        #    dimensions match the TextEncoder's fixed patch grid (37×37),
+        #    because the text tokens are always shaped on that grid
+        #    regardless of the real image resolution.
+        #    Real images are only used later for the frozen aggregator
+        #    alignment loss.
         # ------------------------------------------------------------------
         if images is not None:
             if images.dim() == 4:
                 images = images.unsqueeze(0)  # [S, C, H, W] → [1, S, C, H, W]
             S = images.shape[1]
-            # First frame only: gives DPT head the correct H, W reference.
-            ref_images = images[:, :1].contiguous()  # [B, 1, 3, H, W]
         else:
             S = 1
-            ref_images = self._dummy_images(B, device)  # [B, 1, 3, 518, 518]
+        # Always use dummy images so patch_h/patch_w match the TextEncoder grid.
+        ref_images = self._dummy_images(B, device)  # [B, 1, 3, 518, 518]
 
         # ------------------------------------------------------------------
         # 1. Text encoding (student) — always executed
