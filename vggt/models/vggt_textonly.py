@@ -307,8 +307,10 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
             if images.dim() == 4:
                 images = images.unsqueeze(0)  # [S, C, H, W] → [1, S, C, H, W]
             S = images.shape[1]
+            target_H, target_W = images.shape[3], images.shape[4]
         else:
             S = 1
+            target_H, target_W = None, None
         # Always use dummy images so patch_h/patch_w match the TextEncoder grid.
         ref_images = self._dummy_images(B, device)  # [B, 1, 3, 518, 518]
 
@@ -342,6 +344,21 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
                     images=ref_images,
                     patch_start_idx=patch_start_idx,
                 )
+                # Resize to real image spatial dims if they differ from the
+                # dummy grid (e.g. 518×518 → 476×518).
+                if target_H is not None:
+                    dH, dW = depth.shape[2], depth.shape[3]
+                    if dH != target_H or dW != target_W:
+                        # depth: [B, 1, dH, dW, 1] → interpolate on H,W
+                        depth = depth.permute(0, 1, 4, 2, 3)          # [B,1,1,dH,dW]
+                        depth = F.interpolate(
+                            depth.reshape(B, 1, dH, dW),
+                            size=(target_H, target_W), mode="bilinear", align_corners=False,
+                        ).reshape(B, 1, 1, target_H, target_W).permute(0, 1, 3, 4, 2)  # [B,1,tH,tW,1]
+                        depth_conf = F.interpolate(
+                            depth_conf.reshape(B, 1, dH, dW),
+                            size=(target_H, target_W), mode="bilinear", align_corners=False,
+                        ).reshape(B, 1, target_H, target_W)
                 # depth: [B, 1, H, W, 1] → [B, S, H, W, 1]
                 predictions["depth"] = depth.expand(-1, S, -1, -1, -1)
                 # depth_conf: [B, 1, H, W] → [B, S, H, W]
@@ -353,6 +370,20 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
                     images=ref_images,
                     patch_start_idx=patch_start_idx,
                 )
+                # Resize to real image spatial dims if needed.
+                if target_H is not None:
+                    pH, pW = pts3d.shape[2], pts3d.shape[3]
+                    if pH != target_H or pW != target_W:
+                        C = pts3d.shape[4]
+                        # pts3d: [B, 1, pH, pW, C]
+                        pts3d = F.interpolate(
+                            pts3d.squeeze(1).permute(0, 3, 1, 2),     # [B,C,pH,pW]
+                            size=(target_H, target_W), mode="bilinear", align_corners=False,
+                        ).permute(0, 2, 3, 1).unsqueeze(1)            # [B,1,tH,tW,C]
+                        pts3d_conf = F.interpolate(
+                            pts3d_conf.reshape(B, 1, pH, pW),
+                            size=(target_H, target_W), mode="bilinear", align_corners=False,
+                        ).reshape(B, 1, target_H, target_W)
                 predictions["world_points"] = pts3d.expand(-1, S, -1, -1, -1)
                 predictions["world_points_conf"] = pts3d_conf.expand(-1, S, -1, -1)
 
