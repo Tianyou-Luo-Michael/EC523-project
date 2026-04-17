@@ -308,7 +308,7 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
         # ------------------------------------------------------------------
         predictions: dict = {}
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             if self.camera_head is not None:
                 pose_enc_list = self.camera_head(text_tokens_list)
                 predictions["pose_enc"] = pose_enc_list[-1]
@@ -414,18 +414,21 @@ def alignment_loss(
     cos_total = torch.tensor(0.0, device=text_tokens_list[0].device)
 
     for text_t, img_t in zip(text_tokens_list, image_tokens_list):
-        # text_t / img_t: [B, 1, P, D]
-        B, S, P, D = text_t.shape
-        t_flat = text_t.reshape(B * S * P, D)
-        i_flat = img_t.reshape(B * S * P, D)
+        # text_t: [B, S_t, P_t, D]   img_t: [B, S_i, P_i, D]
+        # P_t may differ from P_i when input images are not 518x518.
+        # Mean-pool over all token positions -> [B, D] so the loss is
+        # always numerically valid regardless of resolution.
+        B, _, _, D = text_t.shape
+        t_pooled = text_t.reshape(B, -1, D).mean(dim=1)   # [B, D]
+        i_pooled = img_t.reshape(B, -1, D).mean(dim=1)    # [B, D]
 
         if mse_weight > 0:
-            mse_total = mse_total + F.mse_loss(t_flat, i_flat)
+            mse_total = mse_total + F.mse_loss(t_pooled, i_pooled)
 
         if cosine_weight > 0:
             # cosine_similarity returns values in [-1, 1]; loss in [0, 2]
             cos_total = cos_total + (
-                1.0 - F.cosine_similarity(t_flat, i_flat, dim=-1)
+                1.0 - F.cosine_similarity(t_pooled, i_pooled, dim=-1)
             ).mean()
 
     n = len(text_tokens_list)

@@ -209,8 +209,7 @@ optim:
 distributed:
   backend: nccl
   comms_dtype: null
-  find_unused_parameters: True    # text_encoder spatial_queries / camera_token may
-                                   # be unused in early warm-up steps
+  find_unused_parameters: False   # all trainable params are used in every forward pass
   timeout_mins: 30
   gradient_as_bucket_view: True
   bucket_cap_mb: 25
