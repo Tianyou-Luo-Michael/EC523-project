@@ -5,20 +5,21 @@ from vggt.models.vggt import VGGT
 from vggt.models.adapter import CrossAttentionAdapter
 
 
-class FrozenVGGT_Aggregator_0(VGGT):
+class FrozenVGGT_Aggregator_12(VGGT):
     """
     VGGT with all parameters frozen + a trainable CrossAttentionAdapter.
+
+    Variant: cross-attention queries come from the middle aggregator layer
+    (len // 2), but the delta is added to the final token which the depth and
+    camera heads consume. This tests whether mid-layer spatial features
+    attend better to CLIP text than final-layer features.
 
     CLIP is stored via object.__setattr__ to bypass nn.Module registration,
     keeping its ~400M params out of state_dict() and parameters().
     Only the adapter (~3.4M params) is trainable.
 
-    Gradient flow: loss → heads → conditioned_tokens[-1] → delta → adapter
-                                                           ↛ VGGT (frozen)
-
-    All tokens are cast to float32 before the adapter and heads — the DPT
-    head reads every entry in aggregated_tokens_list as a feature pyramid,
-    so dtype must be consistent across the entire list.
+    Gradient flow: loss → heads → tokens[-1] + delta → adapter
+                                                      ↛ VGGT (frozen)
     """
 
     def __init__(
@@ -38,16 +39,13 @@ class FrozenVGGT_Aggregator_0(VGGT):
             **vggt_kwargs,
         )
 
-        # Bypass nn.Module.__setattr__
         object.__setattr__(self, '_clip_model', clip_model)
 
-        # Freeze VGGT and CLIP
         for p in self.parameters():
             p.requires_grad_(False)
         for p in self._clip_model.parameters():
             p.requires_grad_(False)
 
-        # d_model matches heads
         self.adapter = CrossAttentionAdapter(
             d_model=embed_dim * 2,
             d_text=d_text,
@@ -93,7 +91,6 @@ class FrozenVGGT_Aggregator_0(VGGT):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        # Frozen aggregator
         with torch.no_grad():
             aggregated_tokens_list, patch_start_idx = self.aggregator(images)
 
@@ -101,25 +98,26 @@ class FrozenVGGT_Aggregator_0(VGGT):
             clip_seq = self._encode_captions(captions, images.device)
 
             with torch.cuda.amp.autocast(enabled=False):
-                tokens_f32 = [t.float() for t in aggregated_tokens_list]
+                tokens_f32   = [t.float() for t in aggregated_tokens_list]
                 clip_seq_f32 = clip_seq.float()
 
-                target_idx = len(tokens_f32) // 2
-
-                B, S, N, D = tokens_f32[target_idx].shape
+                # Query from middle layer, inject into last token.
+                # The depth/camera heads consume tokens[-1], so delta must land
+                # there to create a gradient path back to the adapter.
+                query_idx = len(tokens_f32) // 2
+                B, S, N, D = tokens_f32[query_idx].shape
                 clip_seq_exp = clip_seq_f32.unsqueeze(1).expand(-1, S, -1, -1).reshape(B * S, 77, -1)
 
                 delta = self.adapter(
-                    tokens_f32[target_idx].reshape(B * S, N, D),
+                    tokens_f32[query_idx].reshape(B * S, N, D),
                     clip_seq_exp,
                 ).reshape(B, S, N, D)
 
-                tokens_f32[target_idx] = tokens_f32[target_idx] + delta
+                tokens_f32[-1] = tokens_f32[-1] + delta
                 aggregated_tokens_list = tokens_f32
 
         predictions = {}
 
-        # Heads are frozen but differentiable
         with torch.cuda.amp.autocast(enabled=False):
             if self.camera_head is not None:
                 pose_enc_list = self.camera_head(aggregated_tokens_list)

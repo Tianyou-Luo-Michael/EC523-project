@@ -5,21 +5,23 @@ from vggt.models.vggt import VGGT
 from vggt.models.adapter import CrossAttentionAdapter
 
 
-class FrozenVGGT_Aggregator_0(VGGT):
+class FrozenVGGT_Aggregator_DPT(VGGT):
     """
     VGGT with all parameters frozen + a trainable CrossAttentionAdapter.
 
-    Variant: cross-attention queries come from aggregator layer 0 (earliest
-    features), but the delta is added to the final token which the depth and
-    camera heads consume. This tests whether early-layer spatial features
-    attend better to CLIP text than final-layer features.
+    Injects cross-attention adapter at the four DPT pyramid levels of
+    aggregated_tokens_list: indices [4, 11, 17, 23] — the exact entries
+    read by the DPTHead when building its multi-scale feature pyramid
+    for depth and point map prediction.
 
     CLIP is stored via object.__setattr__ to bypass nn.Module registration,
     keeping its ~400M params out of state_dict() and parameters().
     Only the adapter (~3.4M params) is trainable.
 
-    Gradient flow: loss → heads → tokens[-1] + delta → adapter
-                                                      ↛ VGGT (frozen)
+    Gradient flow: loss → heads → conditioned_tokens → delta → adapter
+                                                       ↛ VGGT (frozen)
+
+    All tokens are cast to float32 before the adapter and heads.
     """
 
     def __init__(
@@ -29,7 +31,7 @@ class FrozenVGGT_Aggregator_0(VGGT):
         patch_size: int = 14,
         embed_dim: int = 1024,
         adapter_dim: int = 512,
-        d_text: int = 512,      # 512 for ViT-B/32, 768 for ViT-L/14
+        d_text: int = 512,
         **vggt_kwargs,
     ):
         super().__init__(
@@ -56,13 +58,6 @@ class FrozenVGGT_Aggregator_0(VGGT):
 
     @torch.no_grad()
     def _encode_captions(self, captions: list[str], device) -> torch.Tensor:
-        """
-        Returns token-level CLIP hidden states [B, 77, d_text] in float16.
-
-        Token-level (not pooled) so each VGGT spatial token can attend
-        differently to different words — pooled embeddings degenerate to
-        a global bias since softmax over 1 token always equals 1.
-        """
         text = clip.tokenize(captions, truncate=True).to(device)
         x = self._clip_model.token_embedding(text).type(self._clip_model.dtype)
         x = x + self._clip_model.positional_embedding.type(self._clip_model.dtype)
@@ -77,15 +72,6 @@ class FrozenVGGT_Aggregator_0(VGGT):
         query_points: torch.Tensor = None,
         captions: list[str] = None,
     ) -> dict:
-        """
-        Args:
-            images       : [S, 3, H, W] or [B, S, 3, H, W], range [0, 1]
-            query_points : [N, 2] or [B, N, 2] — optional, for tracking
-            captions     : list of B strings — optional, enables adapter.
-                           If None, runs as vanilla VGGT.
-        Returns:
-            Same dict as VGGT.forward().
-        """
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
         if query_points is not None and len(query_points.shape) == 2:
@@ -101,19 +87,30 @@ class FrozenVGGT_Aggregator_0(VGGT):
                 tokens_f32   = [t.float() for t in aggregated_tokens_list]
                 clip_seq_f32 = clip_seq.float()
 
-                # Query from layer 0 (earliest features), inject into last token.
-                # The depth/camera heads consume tokens[-1], so delta must land
-                # there to create a gradient path back to the adapter.
-                query_idx = 0
-                B, S, N, D = tokens_f32[query_idx].shape
-                clip_seq_exp = clip_seq_f32.unsqueeze(1).expand(-1, S, -1, -1).reshape(B * S, 77, -1)
+                target_indices = [4, 11, 17, 23]
 
-                delta = self.adapter(
-                    tokens_f32[query_idx].reshape(B * S, N, D),
-                    clip_seq_exp,
-                ).reshape(B, S, N, D)
+                for target_idx in target_indices:
+                    if target_idx >= len(tokens_f32):
+                        raise IndexError(
+                            f"target_idx={target_idx} out of range for "
+                            f"aggregated_tokens_list of length {len(tokens_f32)}"
+                        )
 
-                tokens_f32[-1] = tokens_f32[-1] + delta
+                    B, S, N, D = tokens_f32[target_idx].shape
+                    clip_seq_exp = (
+                        clip_seq_f32
+                        .unsqueeze(1)
+                        .expand(-1, S, -1, -1)
+                        .reshape(B * S, 77, -1)
+                    )
+
+                    delta = self.adapter(
+                        tokens_f32[target_idx].reshape(B * S, N, D),
+                        clip_seq_exp,
+                    ).reshape(B, S, N, D)
+
+                    tokens_f32[target_idx] = tokens_f32[target_idx] + delta
+
                 aggregated_tokens_list = tokens_f32
 
         predictions = {}
