@@ -197,6 +197,7 @@ class VGGTTextOnlyTrainer(Trainer):
             f"Heads frozen for warm-up ({self.freeze_heads_steps} steps). "
             "Only text encoder will train during this phase."
         )
+        self._refresh_gradient_clipper_configs()
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.text_model_name)
         logging.info(f"Tokenizer loaded: {self.text_model_name}")
@@ -240,6 +241,35 @@ class VGGTTextOnlyTrainer(Trainer):
                 if head is not None:
                     head.train()
 
+    def _refresh_gradient_clipper_configs(self) -> None:
+        """Ensure gradient clipping covers all currently trainable modules."""
+        if self.gradient_clipper is None or not hasattr(self.gradient_clipper, "configs"):
+            return
+
+        default_max_norm = None
+        default_norm_type = 2
+        if self.gradient_clipper.configs:
+            default_max_norm = self.gradient_clipper.configs[0].get("max_norm")
+            default_norm_type = self.gradient_clipper.configs[0].get("norm_type", 2)
+
+        inner = self._inner_model()
+        module_names = ["text_encoder"]
+        for name in ("camera_head", "depth_head", "point_head"):
+            head = getattr(inner, name, None)
+            if head is not None and any(p.requires_grad for p in head.parameters()):
+                module_names.append(name)
+
+        self.gradient_clipper.configs = [
+            {
+                "module_names": module_names,
+                "max_norm": default_max_norm,
+                "norm_type": default_norm_type,
+            }
+        ]
+        self.gradient_clipper.is_initialized = False
+        self.gradient_clipper.params_to_clip_by_config = None
+        logging.info("Gradient clipper modules: %s", ", ".join(module_names))
+
     def _maybe_unfreeze_heads(self):
         """
         Unfreeze downstream heads after the warm-up period and rebuild the
@@ -255,11 +285,8 @@ class VGGTTextOnlyTrainer(Trainer):
         self._heads_unfrozen = True
 
         # Rebuild optimizer to include the newly unfrozen head params
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        import hydra
-        optimizer = hydra.utils.instantiate(self.optim_conf.optimizer, trainable_params)
-        schedulers = [{} for _ in optimizer.param_groups]
-        self._optims = [OptimizerWrapper(optimizer, schedulers)]
+        self._optims = self._build_optims()
+        self._refresh_gradient_clipper_configs()
 
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         logging.info(
@@ -516,6 +543,7 @@ class VGGTTextOnlyTrainer(Trainer):
             inner.unfreeze_heads()
             self._heads_unfrozen = True
             logging.info("Heads restored to unfrozen state from checkpoint.")
+        self._refresh_gradient_clipper_configs()
 
         # Optimizer
         if "optimizer" in ckpt:
