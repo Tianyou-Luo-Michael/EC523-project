@@ -77,11 +77,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Ensure config path is absolute so the script works from any directory
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_dir = os.path.join(script_dir, "config")
-
-    with initialize(version_base=None, config_path=config_dir):
+    with initialize(version_base=None, config_path="config"):
         cfg = compose(config_name=args.config, overrides=args.overrides)
 
     cfg.mode = "val"

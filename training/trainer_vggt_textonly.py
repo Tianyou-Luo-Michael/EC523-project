@@ -10,6 +10,8 @@
 
 import os
 import logging
+import hashlib
+import re
 from typing import List, Mapping, Optional
 
 import torch
@@ -17,7 +19,6 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from hydra.utils import instantiate
-from transformers import CLIPTokenizer
 
 from trainer import Trainer
 from vggt.models.vggt import VGGT
@@ -80,6 +81,8 @@ class VGGTTextOnlyTrainer(Trainer):
         self.enable_depth = enable_depth
         self.enable_point = enable_point
         self._heads_unfrozen = False
+        self.text_vocab_size = 65536
+        self.text_max_length = 77
 
         if caption_manifest_path is not None:
             self.caption_lookup = load_caption_lookup_by_mode(
@@ -130,7 +133,6 @@ class VGGTTextOnlyTrainer(Trainer):
           2. Construct VGGTTextOnly and load aggregator + head weights.
           3. Freeze the aggregator (teacher stays frozen throughout).
           4. Freeze heads for the warm-up phase.
-          5. Initialise the CLIPTokenizer used to tokenise captions.
         """
         logging.info("VGGTTextOnlyTrainer: setting up components")
         self.epoch = 0
@@ -197,11 +199,7 @@ class VGGTTextOnlyTrainer(Trainer):
             "Only text encoder will train during this phase."
         )
 
-        # ── (6) CLIPTokenizer ─────────────────────────────────────────────────
-        self.tokenizer = CLIPTokenizer.from_pretrained(self.clip_model_name)
-        logging.info(f"CLIPTokenizer loaded: {self.clip_model_name}")
-
-        # ── (7) Log summary ───────────────────────────────────────────────────
+        # ── (6) Log summary ───────────────────────────────────────────────────
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.model.parameters())
         if self.rank == 0:
@@ -226,22 +224,13 @@ class VGGTTextOnlyTrainer(Trainer):
         """
         Set training modes:
           - Aggregator: always eval (frozen teacher — suppresses BN / dropout).
-          - CLIP inside text_encoder: always eval (frozen).
-          - text_encoder (non-CLIP parts): train.
+                    - text_encoder: train.
           - Heads: train only after warm-up; eval during warm-up.
         """
         nn.Module.train(self.model, False)  # everything → eval first
 
         inner = self._inner_model()
-
-        # Text encoder minus CLIP → train
-        # CLIP stays eval because freeze_clip=True keeps .requires_grad=False,
-        # but calling .train() would still affect dropout/BN.
-        inner.text_encoder.text_proj.train()
-        inner.text_encoder.cross_attn.train()
-        inner.text_encoder.cross_attn_norm.train()
-        inner.text_encoder.blocks.train()
-        inner.text_encoder.out_proj.train()
+        inner.text_encoder.train()
 
         # Heads → train only once warm-up is complete
         if self._heads_unfrozen:
@@ -278,23 +267,33 @@ class VGGTTextOnlyTrainer(Trainer):
 
     def _tokenize(self, captions: List[str]) -> tuple:
         """
-        Tokenise captions with the CLIPTokenizer.
+        Tokenise captions using deterministic hashing (no external tokenizer).
 
         Returns:
             input_ids (Tensor[B, L]): token ids on self.device.
             attention_mask (Tensor[B, L]): attention mask on self.device.
         """
-        enc = self.tokenizer(
-            captions,
-            padding="max_length",
-            truncation=True,
-            max_length=77,
-            return_tensors="pt",
+        batch_size = len(captions)
+        input_ids = torch.zeros(
+            (batch_size, self.text_max_length),
+            dtype=torch.long,
+            device=self.device,
         )
-        return (
-            enc["input_ids"].to(self.device),
-            enc["attention_mask"].to(self.device),
+        attention_mask = torch.zeros(
+            (batch_size, self.text_max_length),
+            dtype=torch.long,
+            device=self.device,
         )
+
+        for i, caption in enumerate(captions):
+            tokens = re.findall(r"\w+|[^\w\s]", caption.lower())
+            for j, tok in enumerate(tokens[: self.text_max_length]):
+                tok_id = int(hashlib.sha1(tok.encode("utf-8")).hexdigest()[:8], 16)
+                tok_id = 2 + (tok_id % (self.text_vocab_size - 2))
+                input_ids[i, j] = tok_id
+                attention_mask[i, j] = 1
+
+        return input_ids, attention_mask
 
     def _get_captions(self, batch: Mapping) -> Optional[List[str]]:
         """

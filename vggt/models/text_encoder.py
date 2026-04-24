@@ -17,8 +17,8 @@ class TextEncoder(nn.Module):
     Takes tokenized text and produces aggregated_tokens_list and patch_start_idx
     in the same format expected by the downstream prediction heads (DPTHead, CameraHead, etc.).
 
-    The encoder works in three stages:
-      1. Encode text via a frozen CLIP text transformer -> [B, L, clip_dim]
+        The encoder works in three stages:
+            1. Embed token ids via a trainable embedding table -> [B, L, embed_dim]
       2. Cross-attend with learnable spatial queries to produce patch tokens -> [B, num_patches, embed_dim]
       3. Prepend camera/register special tokens and refine through transformer blocks,
          collecting per-block outputs to build aggregated_tokens_list.
@@ -32,9 +32,9 @@ class TextEncoder(nn.Module):
         mlp_ratio (float): MLP hidden-dim expansion ratio. Default: 4.0.
         depth (int): Number of transformer blocks. Must be >= max(intermediate_layer_idx) + 1
             used in DPTHead (default indices go up to 23, so depth >= 24). Default: 24.
-        clip_model_name (str): HuggingFace model name for the CLIP text encoder. Default:
-            "openai/clip-vit-large-patch14" (hidden_dim=768).
-        freeze_clip (bool): If True, freeze all CLIP text encoder weights. Default: True.
+        vocab_size (int): Vocabulary size for token embeddings. Default: 65536.
+        token_embed_dim (int): Internal token embedding dim before projection.
+            Default: 768.
     """
 
     def __init__(
@@ -48,18 +48,16 @@ class TextEncoder(nn.Module):
         depth: int = 24,
         clip_model_name: str = "openai/clip-vit-large-patch14",
         freeze_clip: bool = True,
+        vocab_size: int = 65536,
+        token_embed_dim: int = 768,
     ):
         super().__init__()
 
-        # ---- CLIP text backbone ----
-        from transformers import CLIPTextModel
-
-        self.clip = CLIPTextModel.from_pretrained(clip_model_name)
-        clip_dim = self.clip.config.hidden_size  # 768 for ViT-L/14
-
-        if freeze_clip:
-            for param in self.clip.parameters():
-                param.requires_grad_(False)
+        # NOTE: CLIP is intentionally not used in this encoder.
+        # We keep clip_model_name/freeze_clip in the signature for backward
+        # compatibility with existing configs.
+        _ = clip_model_name
+        _ = freeze_clip
 
         # ---- Spatial layout ----
         self.patch_h = patch_h
@@ -67,12 +65,17 @@ class TextEncoder(nn.Module):
         self.num_patches = patch_h * patch_w  # 37*37 = 1369 by default
         self.embed_dim = embed_dim
 
+        # ---- Token embedding ----
+        self.vocab_size = vocab_size
+        self.token_embed_dim = token_embed_dim
+        self.token_embed = nn.Embedding(vocab_size, token_embed_dim, padding_idx=0)
+
         # patch_start_idx: 1 camera token + num_register_tokens (mirrors Aggregator)
         self.patch_start_idx = 1 + num_register_tokens
 
         # ---- Text projection ----
-        # Map CLIP's hidden dim to the model's embed_dim
-        self.text_proj = nn.Linear(clip_dim, embed_dim)
+        # Map token embedding dim to model embed_dim.
+        self.text_proj = nn.Linear(token_embed_dim, embed_dim)
 
         # ---- Cross-attention: spatial queries <- text tokens ----
         # Each of the num_patches spatial queries learns to attend to relevant
@@ -144,12 +147,11 @@ class TextEncoder(nn.Module):
         B = input_ids.shape[0]
 
         # ------------------------------------------------------------------
-        # Stage 1: Encode text with CLIP -> [B, L, clip_dim]
+        # Stage 1: Embed token ids -> [B, L, token_embed_dim]
         # ------------------------------------------------------------------
-        clip_out = self.clip(input_ids=input_ids, attention_mask=attention_mask)
-        text_tokens = clip_out.last_hidden_state  # [B, L, clip_dim]
+        text_tokens = self.token_embed(input_ids)  # [B, L, token_embed_dim]
 
-        # Project CLIP features to embed_dim -> [B, L, embed_dim]
+        # Project token embeddings to embed_dim -> [B, L, embed_dim]
         text_tokens = self.text_proj(text_tokens)
 
         # ------------------------------------------------------------------
