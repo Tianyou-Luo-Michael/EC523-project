@@ -268,6 +268,7 @@ class VGGTTextOnlyTrainer(Trainer):
         ]
         self.gradient_clipper.is_initialized = False
         self.gradient_clipper.params_to_clip_by_config = None
+        self.gradient_clipper.setup_clipping(self.model)
         logging.info("Gradient clipper modules: %s", ", ".join(module_names))
 
     def _maybe_unfreeze_heads(self):
