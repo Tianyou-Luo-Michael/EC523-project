@@ -8,6 +8,7 @@ Examples:
 """
 
 import argparse
+import os
 
 from hydra import compose, initialize
 from omegaconf import DictConfig, OmegaConf
@@ -76,7 +77,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    with initialize(version_base=None, config_path="config"):
+    # Ensure config path is absolute so the script works from any directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_dir = os.path.join(script_dir, "config")
+
+    with initialize(version_base=None, config_path=config_dir):
         cfg = compose(config_name=args.config, overrides=args.overrides)
 
     cfg.mode = "val"
