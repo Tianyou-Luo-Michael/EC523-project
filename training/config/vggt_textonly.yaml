@@ -57,6 +57,7 @@ freeze_heads_steps: 500
 # Caption manifest: path to a JSONL file with {"seq_name": ..., "concise": ..., "descriptive": ...}.
 # Set to null if your dataset provides captions directly in the batch (batch["captions"]).
 caption_manifest_path: /projectnb/ec523/projects/proj_vggt/dataset/co3d_curated_captions_train.jsonl
+val_caption_manifest_path: /projectnb/ec523/projects/proj_vggt/dataset/co3d_curated_captions_test.jsonl
 caption_mode: "descriptive"    # "concise" or "descriptive"
 
 # Head enable flags

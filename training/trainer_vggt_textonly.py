@@ -519,6 +519,13 @@ class VGGTTextOnlyTrainer(Trainer):
 
         # Optimizer
         if "optimizer" in ckpt:
+            # Rebuild optimizer so its param groups reflect the current set of
+            # trainable parameters (heads may have just been unfrozen above).
+            # Without this, loading a state dict saved with head params into an
+            # optimizer that only covers text_encoder raises a size-mismatch error.
+            if self.mode != "val":
+                self._optims = self._build_optims()
+
             opt_state = ckpt["optimizer"]
             if isinstance(opt_state, dict):
                 self.optims[0].optimizer.load_state_dict(opt_state)
