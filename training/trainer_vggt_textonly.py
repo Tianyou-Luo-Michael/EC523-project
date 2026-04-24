@@ -19,7 +19,13 @@ import torch.distributed as dist
 from hydra.utils import instantiate
 from transformers import AutoTokenizer
 
-from trainer import Trainer
+from trainer import (
+    Trainer,
+    AverageMeter,
+    ProgressMeter,
+    chunk_batch_for_accum_steps,
+    copy_data_to_device,
+)
 from vggt.models.vggt import VGGT
 from vggt.models.vggt_textonly import VGGTTextOnly, alignment_loss
 from data.caption_manifest import load_caption_lookup_by_mode, get_caption_for_seq
@@ -448,7 +454,135 @@ class VGGTTextOnlyTrainer(Trainer):
         ``_set_student_train_mode()`` inside ``_step`` then forces the
         aggregator back to eval before every forward pass.
         """
-        return super().train_epoch(train_loader)
+        batch_time = AverageMeter("Batch Time", self.device, ":.4f")
+        data_time = AverageMeter("Data Time", self.device, ":.4f")
+        mem = AverageMeter("Mem (GB)", self.device, ":.4f")
+        data_times = []
+        phase = "train"
+
+        loss_names = self._get_scalar_log_keys(phase)
+        loss_names = [f"Loss/{phase}_{name}" for name in loss_names]
+        loss_meters = {
+            name: AverageMeter(name, self.device, ":.4f") for name in loss_names
+        }
+
+        for config in self.gradient_clipper.configs:
+            param_names = ",".join(config["module_names"])
+            meter_key = f"Grad/{param_names}"
+            loss_meters[meter_key] = AverageMeter(meter_key, self.device, ":.4f")
+
+        progress = ProgressMeter(
+            num_batches=len(train_loader),
+            meters=[
+                batch_time,
+                data_time,
+                mem,
+                self.time_elapsed_meter,
+                *loss_meters.values(),
+            ],
+            real_meters={},
+            prefix="Train Epoch: [{}]".format(self.epoch),
+        )
+
+        self.model.train()
+        end = time.time()
+
+        iters_per_epoch = len(train_loader)
+        limit_train_batches = (
+            iters_per_epoch
+            if self.limit_train_batches is None
+            else self.limit_train_batches
+        )
+
+        if self.gradient_clipper is not None:
+            self.gradient_clipper.setup_clipping(self.model)
+
+        for data_iter, batch in enumerate(train_loader):
+            if data_iter > limit_train_batches:
+                break
+
+            data_time.update(time.time() - end)
+            data_times.append(data_time.val)
+
+            with torch.amp.autocast("cuda", enabled=False):
+                batch = self._process_batch(batch)
+
+            batch = copy_data_to_device(batch, self.device, non_blocking=True)
+
+            accum_steps = self.accum_steps
+            if accum_steps == 1:
+                chunked_batches = [batch]
+            else:
+                chunked_batches = chunk_batch_for_accum_steps(batch, accum_steps)
+
+            self._run_steps_on_batch_chunks(chunked_batches, phase, loss_meters)
+
+            assert data_iter <= limit_train_batches
+            exact_epoch = self.epoch + float(data_iter) / limit_train_batches
+            self.where = float(exact_epoch) / self.max_epochs
+
+            assert self.where <= 1 + self.EPSILON
+            if self.where < 1.0:
+                for optim in self.optims:
+                    optim.step_schedulers(self.where)
+            else:
+                logging.warning(
+                    f"Skipping scheduler update since the training is at the end, i.e, {self.where} of [0,1]."
+                )
+
+            if self.steps[phase] % self.logging_conf.log_freq == 0:
+                for i, optim in enumerate(self.optims):
+                    for j, param_group in enumerate(optim.optimizer.param_groups):
+                        for option in optim.schedulers[j]:
+                            optim_prefix = (
+                                f"{i}_"
+                                if len(self.optims) > 1
+                                else (
+                                    "" + f"{j}_"
+                                    if len(optim.optimizer.param_groups) > 1
+                                    else ""
+                                )
+                            )
+                            self.tb_writer.log(
+                                os.path.join("Optim", f"{optim_prefix}", option),
+                                param_group[option],
+                                self.steps[phase],
+                            )
+                self.tb_writer.log(
+                    os.path.join("Optim", "where"),
+                    self.where,
+                    self.steps[phase],
+                )
+
+            if self.gradient_clipper is not None:
+                for optim in self.optims:
+                    self.scaler.unscale_(optim.optimizer)
+
+                grad_norm_dict = self.gradient_clipper(model=self.model)
+
+                for key, grad_norm in grad_norm_dict.items():
+                    meter_key = f"Grad/{key}"
+                    if meter_key not in loss_meters:
+                        loss_meters[meter_key] = AverageMeter(
+                            meter_key, self.device, ":.4f"
+                        )
+                    loss_meters[meter_key].update(grad_norm)
+
+            for optim in self.optims:
+                self.scaler.step(optim.optimizer)
+            self.scaler.update()
+
+            batch_time.update(time.time() - end)
+            end = time.time()
+            self.time_elapsed_meter.update(
+                time.time() - self.start_time + self.ckpt_time_elapsed
+            )
+            mem.update(torch.cuda.max_memory_allocated() // 1e9)
+
+            if data_iter % self.logging_conf.log_freq == 0:
+                progress.display(data_iter)
+
+        return True
 
     # ── Checkpoint ────────────────────────────────────────────────────────────
 
