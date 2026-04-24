@@ -56,6 +56,15 @@ class TextEncoder(nn.Module):
 
         self.text_backbone = AutoModel.from_pretrained(text_model_name)
         text_dim = self.text_backbone.config.hidden_size
+
+        # Some HF backbones (e.g., BERT variants) include a pooler head whose
+        # output is not used here. Exclude it from optimization to avoid DDP
+        # unused-parameter errors when find_unused_parameters=False.
+        if hasattr(self.text_backbone, "pooler") and self.text_backbone.pooler is not None:
+            for p in self.text_backbone.pooler.parameters():
+                p.requires_grad_(False)
+            self.text_backbone.pooler = None
+
         if freeze_text_backbone:
             self.text_backbone.eval()
             for p in self.text_backbone.parameters():
