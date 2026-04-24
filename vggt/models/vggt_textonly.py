@@ -66,11 +66,11 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
         enable_point (bool): Include DPTHead for 3-D world points.
             Default: True.
         enable_depth (bool): Include DPTHead for depth.  Default: True.
-        clip_model_name (str): HuggingFace model name for the CLIP text
-            backbone inside TextEncoder.
-            Default: ``"openai/clip-vit-large-patch14"``.
-        freeze_clip (bool): Freeze CLIP weights inside TextEncoder.
-            Default: True.
+        text_model_name (str): Hugging Face text backbone id used by
+            TextEncoder.
+            Default: ``"sentence-transformers/all-MiniLM-L6-v2"``.
+        freeze_text_backbone (bool): Freeze text backbone weights inside
+            TextEncoder. Default: False.
     """
 
     def __init__(
@@ -81,8 +81,8 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
         enable_camera: bool = True,
         enable_point: bool = True,
         enable_depth: bool = True,
-        clip_model_name: str = "openai/clip-vit-large-patch14",
-        freeze_clip: bool = True,
+        text_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        freeze_text_backbone: bool = False,
     ):
         super().__init__()
 
@@ -100,8 +100,8 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
             embed_dim=embed_dim,
             patch_h=patch_h,
             patch_w=patch_w,
-            clip_model_name=clip_model_name,
-            freeze_clip=freeze_clip,
+            text_model_name=text_model_name,
+            freeze_text_backbone=freeze_text_backbone,
         )
 
         # ------------------------------------------------------------------
@@ -170,8 +170,8 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
     def from_pretrained_vggt(
         cls,
         vggt_model_id: str = "facebook/VGGT-1B",
-        clip_model_name: str = "openai/clip-vit-large-patch14",
-        freeze_clip: bool = True,
+        text_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        freeze_text_backbone: bool = False,
         **init_kwargs,
     ) -> "VGGTTextOnly":
         """
@@ -179,13 +179,13 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
 
         The Aggregator and downstream head weights are copied from the
         pretrained VGGT model.  The TextEncoder is initialised from
-        scratch (its CLIP backbone is loaded from HuggingFace).
+        scratch (its pretrained text backbone is loaded from Hugging Face).
 
         Args:
             vggt_model_id (str): HuggingFace model hub id for the base
                 VGGT checkpoint (e.g. ``"facebook/VGGT-1B"``).
-            clip_model_name (str): CLIP backbone for the TextEncoder.
-            freeze_clip (bool): Freeze CLIP inside TextEncoder.
+            text_model_name (str): HF text backbone for the TextEncoder.
+            freeze_text_backbone (bool): Freeze pretrained text backbone.
             **init_kwargs: Forwarded to ``VGGTTextOnly.__init__``.
 
         Returns:
@@ -205,8 +205,8 @@ class VGGTTextOnly(nn.Module, PyTorchModelHubMixin):
             img_size=img_size,
             patch_size=patch_size,
             embed_dim=embed_dim,
-            clip_model_name=clip_model_name,
-            freeze_clip=freeze_clip,
+            text_model_name=text_model_name,
+            freeze_text_backbone=freeze_text_backbone,
             **init_kwargs,
         )
 

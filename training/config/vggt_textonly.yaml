@@ -33,10 +33,9 @@ max_epochs: 50
 # ── VGGTTextOnly trainer kwargs ──────────────────────────────────────────────
 # Passed directly to VGGTTextOnlyTrainer.__init__.
 
-# CLIP model used inside TextEncoder.
-# "openai/clip-vit-large-patch14" (d_text=768) is strongly recommended as it
-# matches the default TextEncoder configuration.
-clip_model_name: "openai/clip-vit-large-patch14"
+# Pretrained text backbone used by TextEncoder.
+text_model_name: "sentence-transformers/all-MiniLM-L6-v2"
+freeze_text_backbone: false
 
 # Pretrained VGGT used to initialise the aggregator + heads.
 vggt_model_name: "facebook/VGGT-1B"

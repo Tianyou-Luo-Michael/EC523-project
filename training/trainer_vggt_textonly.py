@@ -10,8 +10,6 @@
 
 import os
 import logging
-import hashlib
-import re
 from typing import List, Mapping, Optional
 
 import torch
@@ -19,6 +17,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from hydra.utils import instantiate
+from transformers import AutoTokenizer
 
 from trainer import Trainer
 from vggt.models.vggt import VGGT
@@ -33,9 +32,8 @@ class VGGTTextOnlyTrainer(Trainer):
     """
     Trainer for VGGTTextOnly.
 
-    Only the TextEncoder (minus the frozen CLIP backbone inside it) and the
-    downstream prediction heads are trainable.  The Aggregator (image teacher)
-    is frozen throughout.
+    The TextEncoder and downstream prediction heads are trainable.  The
+    Aggregator (image teacher) is frozen throughout.
 
     Training loss per step:
         objective = alignment_weight * alignment_loss
@@ -55,7 +53,8 @@ class VGGTTextOnlyTrainer(Trainer):
     def __init__(
         self,
         *,
-        clip_model_name: str = "openai/clip-vit-large-patch14",
+        text_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        freeze_text_backbone: bool = False,
         vggt_model_name: str = "facebook/VGGT-1B",
         alignment_weight: float = 1.0,
         mse_weight: float = 0.5,
@@ -70,7 +69,8 @@ class VGGTTextOnlyTrainer(Trainer):
         **kwargs,
     ):
         # Store before super().__init__ because _setup_components is called inside it.
-        self.clip_model_name = clip_model_name
+        self.text_model_name = text_model_name
+        self.freeze_text_backbone = freeze_text_backbone
         self.vggt_model_name = vggt_model_name
         self.alignment_weight = alignment_weight
         self.mse_weight = mse_weight
@@ -81,7 +81,6 @@ class VGGTTextOnlyTrainer(Trainer):
         self.enable_depth = enable_depth
         self.enable_point = enable_point
         self._heads_unfrozen = False
-        self.text_vocab_size = 65536
         self.text_max_length = 77
 
         if caption_manifest_path is not None:
@@ -165,8 +164,8 @@ class VGGTTextOnlyTrainer(Trainer):
             enable_camera=self.enable_camera,
             enable_depth=self.enable_depth,
             enable_point=self.enable_point,
-            clip_model_name=self.clip_model_name,
-            freeze_clip=True,
+            text_model_name=self.text_model_name,
+            freeze_text_backbone=self.freeze_text_backbone,
         )
 
         # ── (3) Load pretrained aggregator + head weights ─────────────────────
@@ -199,13 +198,16 @@ class VGGTTextOnlyTrainer(Trainer):
             "Only text encoder will train during this phase."
         )
 
+        self.tokenizer = AutoTokenizer.from_pretrained(self.text_model_name)
+        logging.info(f"Tokenizer loaded: {self.text_model_name}")
+
         # ── (6) Log summary ───────────────────────────────────────────────────
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.model.parameters())
         if self.rank == 0:
             logging.info(
                 f"Trainable: {trainable:,} / {total:,} "
-                f"(CLIP backbone + aggregator excluded from trainable count)"
+                f"(frozen aggregator excluded from trainable count)"
             )
             safe_makedirs(self.logging_conf.log_dir)
             model_summary_path = os.path.join(self.logging_conf.log_dir, "model.txt")
@@ -267,33 +269,20 @@ class VGGTTextOnlyTrainer(Trainer):
 
     def _tokenize(self, captions: List[str]) -> tuple:
         """
-        Tokenise captions using deterministic hashing (no external tokenizer).
+        Tokenise captions using the pretrained tokenizer.
 
         Returns:
             input_ids (Tensor[B, L]): token ids on self.device.
             attention_mask (Tensor[B, L]): attention mask on self.device.
         """
-        batch_size = len(captions)
-        input_ids = torch.zeros(
-            (batch_size, self.text_max_length),
-            dtype=torch.long,
-            device=self.device,
+        enc = self.tokenizer(
+            captions,
+            padding="max_length",
+            truncation=True,
+            max_length=self.text_max_length,
+            return_tensors="pt",
         )
-        attention_mask = torch.zeros(
-            (batch_size, self.text_max_length),
-            dtype=torch.long,
-            device=self.device,
-        )
-
-        for i, caption in enumerate(captions):
-            tokens = re.findall(r"\w+|[^\w\s]", caption.lower())
-            for j, tok in enumerate(tokens[: self.text_max_length]):
-                tok_id = int(hashlib.sha1(tok.encode("utf-8")).hexdigest()[:8], 16)
-                tok_id = 2 + (tok_id % (self.text_vocab_size - 2))
-                input_ids[i, j] = tok_id
-                attention_mask[i, j] = 1
-
-        return input_ids, attention_mask
+        return enc["input_ids"].to(self.device), enc["attention_mask"].to(self.device)
 
     def _get_captions(self, batch: Mapping) -> Optional[List[str]]:
         """
@@ -441,9 +430,8 @@ class VGGTTextOnlyTrainer(Trainer):
         """
         Save text_encoder + head weights.
 
-        The aggregator (1.2 B pretrained VGGT params) and CLIP backbone are
-        NOT saved — they are re-loaded from their respective checkpoints at
-        run time.
+        The aggregator (1.2 B pretrained VGGT params) and text backbone are
+        NOT saved — they are re-loaded from their checkpoints at run time.
 
         Saved keys:
           text_encoder   — text_encoder.state_dict()

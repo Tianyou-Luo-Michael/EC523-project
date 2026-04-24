@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+from transformers import AutoModel
 
 from vggt.layers.block import Block
 
@@ -18,7 +19,7 @@ class TextEncoder(nn.Module):
     in the same format expected by the downstream prediction heads (DPTHead, CameraHead, etc.).
 
         The encoder works in three stages:
-            1. Embed token ids via a trainable embedding table -> [B, L, embed_dim]
+            1. Encode text with a pretrained HF text backbone -> [B, L, d_text]
       2. Cross-attend with learnable spatial queries to produce patch tokens -> [B, num_patches, embed_dim]
       3. Prepend camera/register special tokens and refine through transformer blocks,
          collecting per-block outputs to build aggregated_tokens_list.
@@ -32,9 +33,11 @@ class TextEncoder(nn.Module):
         mlp_ratio (float): MLP hidden-dim expansion ratio. Default: 4.0.
         depth (int): Number of transformer blocks. Must be >= max(intermediate_layer_idx) + 1
             used in DPTHead (default indices go up to 23, so depth >= 24). Default: 24.
-        vocab_size (int): Vocabulary size for token embeddings. Default: 65536.
-        token_embed_dim (int): Internal token embedding dim before projection.
-            Default: 768.
+        text_model_name (str): Pretrained Hugging Face text backbone id.
+            Default: "sentence-transformers/all-MiniLM-L6-v2".
+        freeze_text_backbone (bool): If True, freeze the pretrained text
+            backbone and train only downstream text-conditioning layers.
+            Default: False.
     """
 
     def __init__(
@@ -46,18 +49,17 @@ class TextEncoder(nn.Module):
         num_heads: int = 16,
         mlp_ratio: float = 4.0,
         depth: int = 24,
-        clip_model_name: str = "openai/clip-vit-large-patch14",
-        freeze_clip: bool = True,
-        vocab_size: int = 65536,
-        token_embed_dim: int = 768,
+        text_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        freeze_text_backbone: bool = False,
     ):
         super().__init__()
 
-        # NOTE: CLIP is intentionally not used in this encoder.
-        # We keep clip_model_name/freeze_clip in the signature for backward
-        # compatibility with existing configs.
-        _ = clip_model_name
-        _ = freeze_clip
+        self.text_backbone = AutoModel.from_pretrained(text_model_name)
+        text_dim = self.text_backbone.config.hidden_size
+        if freeze_text_backbone:
+            self.text_backbone.eval()
+            for p in self.text_backbone.parameters():
+                p.requires_grad_(False)
 
         # ---- Spatial layout ----
         self.patch_h = patch_h
@@ -65,17 +67,12 @@ class TextEncoder(nn.Module):
         self.num_patches = patch_h * patch_w  # 37*37 = 1369 by default
         self.embed_dim = embed_dim
 
-        # ---- Token embedding ----
-        self.vocab_size = vocab_size
-        self.token_embed_dim = token_embed_dim
-        self.token_embed = nn.Embedding(vocab_size, token_embed_dim, padding_idx=0)
-
         # patch_start_idx: 1 camera token + num_register_tokens (mirrors Aggregator)
         self.patch_start_idx = 1 + num_register_tokens
 
         # ---- Text projection ----
-        # Map token embedding dim to model embed_dim.
-        self.text_proj = nn.Linear(token_embed_dim, embed_dim)
+        # Map pretrained text features to model embed_dim.
+        self.text_proj = nn.Linear(text_dim, embed_dim)
 
         # ---- Cross-attention: spatial queries <- text tokens ----
         # Each of the num_patches spatial queries learns to attend to relevant
@@ -147,11 +144,15 @@ class TextEncoder(nn.Module):
         B = input_ids.shape[0]
 
         # ------------------------------------------------------------------
-        # Stage 1: Embed token ids -> [B, L, token_embed_dim]
+        # Stage 1: Encode text with pretrained backbone -> [B, L, d_text]
         # ------------------------------------------------------------------
-        text_tokens = self.token_embed(input_ids)  # [B, L, token_embed_dim]
+        backbone_out = self.text_backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        text_tokens = backbone_out.last_hidden_state
 
-        # Project token embeddings to embed_dim -> [B, L, embed_dim]
+        # Project text features to embed_dim -> [B, L, embed_dim]
         text_tokens = self.text_proj(text_tokens)
 
         # ------------------------------------------------------------------
