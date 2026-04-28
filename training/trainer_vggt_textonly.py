@@ -10,6 +10,7 @@
 
 import os
 import logging
+import time
 from typing import List, Mapping, Optional
 
 import torch
@@ -680,21 +681,25 @@ class VGGTTextOnlyTrainer(Trainer):
             logging.info("Heads restored to unfrozen state from checkpoint.")
         self._refresh_gradient_clipper_configs()
 
-        # Optimizer
+        # Optimizer (training only)
         if "optimizer" in ckpt:
-            # Rebuild optimizer so its param groups reflect the current set of
-            # trainable parameters (heads may have just been unfrozen above).
-            # Without this, loading a state dict saved with head params into an
-            # optimizer that only covers text_encoder raises a size-mismatch error.
-            if self.mode != "val":
+            if self.mode == "val":
+                logging.info(
+                    "Validation mode: skipping optimizer state restore from checkpoint."
+                )
+            else:
+                # Rebuild optimizer so its param groups reflect the current set of
+                # trainable parameters (heads may have just been unfrozen above).
+                # Without this, loading a state dict saved with head params into an
+                # optimizer that only covers text_encoder raises a size-mismatch error.
                 self._optims = self._build_optims()
 
-            opt_state = ckpt["optimizer"]
-            if isinstance(opt_state, dict):
-                self.optims[0].optimizer.load_state_dict(opt_state)
-            elif isinstance(opt_state, list):
-                for optim, state in zip(self.optims, opt_state):
-                    optim.optimizer.load_state_dict(state)
+                opt_state = ckpt["optimizer"]
+                if isinstance(opt_state, dict):
+                    self.optims[0].optimizer.load_state_dict(opt_state)
+                elif isinstance(opt_state, list):
+                    for optim, state in zip(self.optims, opt_state):
+                        optim.optimizer.load_state_dict(state)
 
         # Training progress
         if "epoch" in ckpt:
@@ -702,7 +707,7 @@ class VGGTTextOnlyTrainer(Trainer):
         self.steps = ckpt.get("steps", {"train": 0, "val": 0})
         self.ckpt_time_elapsed = ckpt.get("time_elapsed", 0)
 
-        if self.optim_conf.amp.enabled and "scaler" in ckpt:
+        if self.mode != "val" and self.optim_conf.amp.enabled and "scaler" in ckpt:
             self.scaler.load_state_dict(ckpt["scaler"])
 
     # ── Batch processing ──────────────────────────────────────────────────────
