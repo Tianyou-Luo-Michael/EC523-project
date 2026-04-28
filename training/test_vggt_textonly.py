@@ -71,6 +71,12 @@ def main() -> None:
         help="Optional cap on number of eval batches for quick smoke runs.",
     )
     parser.add_argument(
+        "--point-acc-threshold",
+        type=float,
+        default=0.05,
+        help="L2 threshold used by point-cloud accuracy metric (default: 0.05).",
+    )
+    parser.add_argument(
         "overrides",
         nargs="*",
         help="Additional Hydra overrides, e.g. logging.log_freq=1.",
@@ -82,6 +88,7 @@ def main() -> None:
 
     with open_dict(cfg):
         cfg.mode = "val"
+        cfg.point_acc_threshold = args.point_acc_threshold
         _override_eval_split(cfg, args.split)
 
         if args.checkpoint is not None:
@@ -89,6 +96,15 @@ def main() -> None:
 
         if args.limit_val_batches is not None:
             cfg.limit_val_batches = args.limit_val_batches
+
+        # Ensure validation logs include point-cloud accuracy.
+        if cfg.get("logging") is not None and cfg.logging.get("scalar_keys_to_log") is not None:
+            if cfg.logging.scalar_keys_to_log.get("val") is None:
+                cfg.logging.scalar_keys_to_log.val = {"keys_to_log": []}
+            keys = list(cfg.logging.scalar_keys_to_log.val.get("keys_to_log", []))
+            if "point_acc" not in keys:
+                keys.append("point_acc")
+            cfg.logging.scalar_keys_to_log.val.keys_to_log = keys
 
     print("===== Evaluation config (resolved) =====")
     print(OmegaConf.to_yaml(cfg, resolve=True))

@@ -29,6 +29,7 @@ from trainer import (
 )
 from vggt.models.vggt import VGGT
 from vggt.models.vggt_textonly import VGGTTextOnly, alignment_loss
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from data.caption_manifest import load_caption_lookup_by_mode, get_caption_for_seq
 from train_utils.general import safe_makedirs, model_summary
 from train_utils.optimizer import OptimizerWrapper
@@ -73,6 +74,7 @@ class VGGTTextOnlyTrainer(Trainer):
         enable_camera: bool = True,
         enable_depth: bool = True,
         enable_point: bool = False,
+        point_acc_threshold: float = 0.05,
         **kwargs,
     ):
         # Store before super().__init__ because _setup_components is called inside it.
@@ -87,6 +89,7 @@ class VGGTTextOnlyTrainer(Trainer):
         self.enable_camera = enable_camera
         self.enable_depth = enable_depth
         self.enable_point = enable_point
+        self.point_acc_threshold = point_acc_threshold
         self._heads_unfrozen = False
         self.text_max_length = 77
 
@@ -424,6 +427,13 @@ class VGGTTextOnlyTrainer(Trainer):
             + self.task_weight * loss_dict["objective"]
         )
 
+        # Validation-only metric: point-cloud accuracy under an L2 threshold.
+        # This does not affect optimization; it is only reported as a scalar.
+        if phase == "val":
+            point_acc = self._compute_point_accuracy(predictions, batch)
+            if point_acc is not None:
+                loss_dict["point_acc"] = point_acc
+
         # ── (e) Logging ───────────────────────────────────────────────────────
         log_data = {**predictions, **loss_dict, **batch}
         self._update_and_log_scalars(log_data, phase, self.steps[phase], loss_meters)
@@ -444,6 +454,87 @@ class VGGTTextOnlyTrainer(Trainer):
 
         self.steps[phase] += 1
         return loss_dict
+
+    def _depth_pose_to_world_points(self, depth: torch.Tensor, pose_enc: torch.Tensor) -> torch.Tensor:
+        """
+        Convert depth + pose encoding to world points.
+
+        Args:
+            depth: Tensor[B, S, H, W, 1]
+            pose_enc: Tensor[B, S, 9]
+
+        Returns:
+            Tensor[B, S, H, W, 3]
+        """
+        B, S, H, W, _ = depth.shape
+        z = depth[..., 0]
+
+        extrinsics, intrinsics = pose_encoding_to_extri_intri(
+            pose_enc,
+            image_size_hw=(H, W),
+        )
+
+        dtype = z.dtype
+        device = z.device
+
+        ys = torch.arange(H, device=device, dtype=dtype)
+        xs = torch.arange(W, device=device, dtype=dtype)
+        vv, uu = torch.meshgrid(ys, xs, indexing="ij")
+        uu = uu.view(1, 1, H, W)
+        vv = vv.view(1, 1, H, W)
+
+        fx = intrinsics[..., 0, 0].unsqueeze(-1).unsqueeze(-1)
+        fy = intrinsics[..., 1, 1].unsqueeze(-1).unsqueeze(-1)
+        cx = intrinsics[..., 0, 2].unsqueeze(-1).unsqueeze(-1)
+        cy = intrinsics[..., 1, 2].unsqueeze(-1).unsqueeze(-1)
+
+        x_cam = (uu - cx) * z / fx
+        y_cam = (vv - cy) * z / fy
+        cam_pts = torch.stack([x_cam, y_cam, z], dim=-1)  # [B, S, H, W, 3]
+
+        R = extrinsics[..., :3, :3]   # world -> cam
+        t = extrinsics[..., :3, 3]    # world -> cam translation
+
+        cam_minus_t = cam_pts - t.unsqueeze(2).unsqueeze(2)
+        world_pts = torch.einsum("bshwc,bscd->bshwd", cam_minus_t, R)
+        return world_pts
+
+    def _compute_point_accuracy(self, predictions: Mapping, batch: Mapping) -> Optional[torch.Tensor]:
+        """
+        Compute point-cloud accuracy on valid GT pixels.
+
+        Accuracy is defined as the fraction of valid points with
+        L2(pred, gt) < self.point_acc_threshold.
+        """
+        if "world_points" not in batch or "point_masks" not in batch:
+            return None
+
+        gt_points = batch["world_points"]
+        valid_mask = batch["point_masks"].bool()
+
+        if "world_points" in predictions:
+            pred_points = predictions["world_points"]
+        elif "depth" in predictions and "pose_enc" in predictions:
+            pred_points = self._depth_pose_to_world_points(
+                predictions["depth"],
+                predictions["pose_enc"],
+            )
+        else:
+            return None
+
+        if pred_points.shape != gt_points.shape:
+            return None
+
+        point_error = torch.norm(pred_points - gt_points, dim=-1)
+        finite_mask = torch.isfinite(point_error)
+        eval_mask = valid_mask & finite_mask
+
+        valid_count = int(eval_mask.sum().item())
+        if valid_count == 0:
+            return None
+
+        acc = (point_error[eval_mask] < self.point_acc_threshold).float().mean()
+        return acc
 
     # ── Training epoch (enforce aggregator eval) ──────────────────────────────
 
