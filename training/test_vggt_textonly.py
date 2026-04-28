@@ -11,7 +11,7 @@ import argparse
 import os
 
 from hydra import compose, initialize
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from trainer_vggt_textonly import VGGTTextOnlyTrainer
 
@@ -80,14 +80,15 @@ def main() -> None:
     with initialize(version_base=None, config_path="config"):
         cfg = compose(config_name=args.config, overrides=args.overrides)
 
-    cfg.mode = "val"
-    _override_eval_split(cfg, args.split)
+    with open_dict(cfg):
+        cfg.mode = "val"
+        _override_eval_split(cfg, args.split)
 
-    if args.checkpoint is not None:
-        cfg.checkpoint.resume_checkpoint_path = args.checkpoint
+        if args.checkpoint is not None:
+            cfg.checkpoint.resume_checkpoint_path = args.checkpoint
 
-    if args.limit_val_batches is not None:
-        cfg.limit_val_batches = args.limit_val_batches
+        if args.limit_val_batches is not None:
+            cfg.limit_val_batches = args.limit_val_batches
 
     print("===== Evaluation config (resolved) =====")
     print(OmegaConf.to_yaml(cfg, resolve=True))
