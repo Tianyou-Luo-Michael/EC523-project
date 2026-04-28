@@ -79,6 +79,19 @@ python infer_pointcloud.py \
 
 Output `.ply` files can be opened with MeshLab or CloudCompare.
 
+Text-only model inference (VGGTTextOnly checkpoint):
+```bash
+python infer_pointcloud_textonly.py \
+  --checkpoint logs/vggt_textonly/checkpoint_19.pt \
+  --caption "a cozy kitchen with wooden cabinets" \
+  --out textonly_scene.ply
+```
+
+Notes:
+- If your checkpoint includes `point_head`, the script uses direct 3D point prediction.
+- If `point_head` is absent but `depth_head` + `camera_head` exist, it falls back to depth backprojection.
+- The output is text-conditioned geometry only (no real image colors), so a default RGB is used for all points.
+
 ## Training
 
 Training was run on the Boston University SCC cluster using a curated captioned subset of Co3Dv2, with 619 training sequences and 68 held-out test sequences across 35 categories. The dataset includes RGB images, depth maps, and sequence-level captions generated from multiple views.
