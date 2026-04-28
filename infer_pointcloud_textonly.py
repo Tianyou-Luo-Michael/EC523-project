@@ -7,9 +7,10 @@ Examples:
     --caption "a cozy kitchen with wooden cabinets" \
     --out kitchen_textonly.ply
 
-This script supports two cases:
+This script supports three cases:
 1) Checkpoint includes point head weights -> direct world point prediction.
-2) Checkpoint has only depth+camera heads -> depth backprojection fallback.
+2) Checkpoint has no point head but uses VGGT-initialized point head -> direct world point prediction.
+3) Point head disabled explicitly -> depth backprojection fallback.
 """
 
 import argparse
@@ -74,6 +75,14 @@ def main() -> None:
     parser.add_argument("--conf_threshold", type=float, default=0.1, help="Confidence threshold")
     parser.add_argument("--default_color", default="180,180,180", help="Fallback RGB color (R,G,B)")
     parser.add_argument(
+        "--disable_vggt_point_head",
+        action="store_true",
+        help=(
+            "Disable using VGGT-initialized point head when checkpoint has no point_head. "
+            "If set, script falls back to depth backprojection."
+        ),
+    )
+    parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Compute device",
@@ -92,9 +101,10 @@ def main() -> None:
     if "text_encoder" not in ckpt:
         raise KeyError("Checkpoint is missing 'text_encoder' weights")
 
+    has_ckpt_point_head = "point_head" in ckpt
     enable_camera = "camera_head" in ckpt
     enable_depth = "depth_head" in ckpt
-    enable_point = "point_head" in ckpt
+    enable_point = has_ckpt_point_head or (not args.disable_vggt_point_head)
 
     if not enable_point and not (enable_depth and enable_camera):
         raise ValueError(
@@ -120,8 +130,11 @@ def main() -> None:
         model.camera_head.load_state_dict(ckpt["camera_head"], strict=True)
     if enable_depth and model.depth_head is not None:
         model.depth_head.load_state_dict(ckpt["depth_head"], strict=True)
-    if enable_point and model.point_head is not None:
+    if has_ckpt_point_head and model.point_head is not None:
         model.point_head.load_state_dict(ckpt["point_head"], strict=True)
+        print("Loaded point_head from checkpoint")
+    elif enable_point and model.point_head is not None:
+        print("Checkpoint has no point_head; using original VGGT point_head weights")
 
     model.eval()
 
