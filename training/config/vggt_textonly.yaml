@@ -16,7 +16,7 @@ defaults:
 #   torchrun --nproc_per_node=4 launch_vggt_textonly.py --config vggt_textonly
 # ─────────────────────────────────────────────────────────────────────────────
 
-exp_name: vggt_textonly_noclip_001
+exp_name: vggt_textonly_noclip_003
 img_size: 518
 patch_size: 14
 num_workers: 8
@@ -28,7 +28,7 @@ max_img_per_gpu: 16     # lower than vanilla VGGT due to dual encoder forward
 limit_train_batches: 500
 limit_val_batches: 100
 
-max_epochs: 20
+max_epochs: 2
 
 # ── VGGTTextOnly trainer kwargs ──────────────────────────────────────────────
 # Passed directly to VGGTTextOnlyTrainer.__init__.
