@@ -460,7 +460,7 @@ class Trainer:
             data_time.update(time.time() - end)
             data_times.append(data_time.val)
             
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast('cuda', enabled=False):
                 batch = self._process_batch(batch)
             batch = copy_data_to_device(batch, self.device, non_blocking=True)
 
@@ -473,7 +473,8 @@ class Trainer:
             
             # compute output
             with torch.no_grad():
-                with torch.cuda.amp.autocast(
+                with torch.amp.autocast(
+                    'cuda',
                     enabled=self.optim_conf.amp.enabled,
                     dtype=amp_type,
                 ):
@@ -552,7 +553,7 @@ class Trainer:
             data_times.append(data_time.val)
 
             
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast('cuda', enabled=False):
                 batch = self._process_batch(batch)
 
             batch = copy_data_to_device(batch, self.device, non_blocking=True)
@@ -666,7 +667,8 @@ class Trainer:
             )
 
             with ddp_context:
-                with torch.cuda.amp.autocast(
+                with torch.amp.autocast(
+                    'cuda',
                     enabled=self.optim_conf.amp.enabled,
                     dtype=amp_type,
                 ):

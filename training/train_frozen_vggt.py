@@ -47,7 +47,7 @@ print(f"Trainable: {trainable:,} / {total:,}")  # expect ~3.4M / ~1.2B
 print(f"Gate at init: {model.adapter.gate.item():.4f}")  # must be 0.0000
 
 # Optimizer over adapter params only
-optimizer = AdamW(model.adapter.parameters(), lr=1e-4, weight_decay=1e-2, betas=(0.9, 0.999))
+optimizer = AdamW(model.adapter.parameters(), lr=3e-5, weight_decay=1e-2, betas=(0.9, 0.999))
 scheduler = CosineAnnealingLR(optimizer, T_max=50_000, eta_min=1e-6)
 
 

@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+from transformers import AutoModel
 
 from vggt.layers.block import Block
 
@@ -17,8 +18,8 @@ class TextEncoder(nn.Module):
     Takes tokenized text and produces aggregated_tokens_list and patch_start_idx
     in the same format expected by the downstream prediction heads (DPTHead, CameraHead, etc.).
 
-    The encoder works in three stages:
-      1. Encode text via a frozen CLIP text transformer -> [B, L, clip_dim]
+        The encoder works in three stages:
+            1. Encode text with a pretrained HF text backbone -> [B, L, d_text]
       2. Cross-attend with learnable spatial queries to produce patch tokens -> [B, num_patches, embed_dim]
       3. Prepend camera/register special tokens and refine through transformer blocks,
          collecting per-block outputs to build aggregated_tokens_list.
@@ -32,9 +33,11 @@ class TextEncoder(nn.Module):
         mlp_ratio (float): MLP hidden-dim expansion ratio. Default: 4.0.
         depth (int): Number of transformer blocks. Must be >= max(intermediate_layer_idx) + 1
             used in DPTHead (default indices go up to 23, so depth >= 24). Default: 24.
-        clip_model_name (str): HuggingFace model name for the CLIP text encoder. Default:
-            "openai/clip-vit-large-patch14" (hidden_dim=768).
-        freeze_clip (bool): If True, freeze all CLIP text encoder weights. Default: True.
+        text_model_name (str): Pretrained Hugging Face text backbone id.
+            Default: "sentence-transformers/all-MiniLM-L6-v2".
+        freeze_text_backbone (bool): If True, freeze the pretrained text
+            backbone and train only downstream text-conditioning layers.
+            Default: False.
     """
 
     def __init__(
@@ -46,20 +49,26 @@ class TextEncoder(nn.Module):
         num_heads: int = 16,
         mlp_ratio: float = 4.0,
         depth: int = 24,
-        clip_model_name: str = "openai/clip-vit-large-patch14",
-        freeze_clip: bool = True,
+        text_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        freeze_text_backbone: bool = False,
     ):
         super().__init__()
 
-        # ---- CLIP text backbone ----
-        from transformers import CLIPTextModel
+        self.text_backbone = AutoModel.from_pretrained(text_model_name)
+        text_dim = self.text_backbone.config.hidden_size
 
-        self.clip = CLIPTextModel.from_pretrained(clip_model_name)
-        clip_dim = self.clip.config.hidden_size  # 768 for ViT-L/14
+        # Some HF backbones (e.g., BERT variants) include a pooler head whose
+        # output is not used here. Exclude it from optimization to avoid DDP
+        # unused-parameter errors when find_unused_parameters=False.
+        if hasattr(self.text_backbone, "pooler") and self.text_backbone.pooler is not None:
+            for p in self.text_backbone.pooler.parameters():
+                p.requires_grad_(False)
+            self.text_backbone.pooler = None
 
-        if freeze_clip:
-            for param in self.clip.parameters():
-                param.requires_grad_(False)
+        if freeze_text_backbone:
+            self.text_backbone.eval()
+            for p in self.text_backbone.parameters():
+                p.requires_grad_(False)
 
         # ---- Spatial layout ----
         self.patch_h = patch_h
@@ -71,8 +80,8 @@ class TextEncoder(nn.Module):
         self.patch_start_idx = 1 + num_register_tokens
 
         # ---- Text projection ----
-        # Map CLIP's hidden dim to the model's embed_dim
-        self.text_proj = nn.Linear(clip_dim, embed_dim)
+        # Map pretrained text features to model embed_dim.
+        self.text_proj = nn.Linear(text_dim, embed_dim)
 
         # ---- Cross-attention: spatial queries <- text tokens ----
         # Each of the num_patches spatial queries learns to attend to relevant
@@ -144,12 +153,15 @@ class TextEncoder(nn.Module):
         B = input_ids.shape[0]
 
         # ------------------------------------------------------------------
-        # Stage 1: Encode text with CLIP -> [B, L, clip_dim]
+        # Stage 1: Encode text with pretrained backbone -> [B, L, d_text]
         # ------------------------------------------------------------------
-        clip_out = self.clip(input_ids=input_ids, attention_mask=attention_mask)
-        text_tokens = clip_out.last_hidden_state  # [B, L, clip_dim]
+        backbone_out = self.text_backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        text_tokens = backbone_out.last_hidden_state
 
-        # Project CLIP features to embed_dim -> [B, L, embed_dim]
+        # Project text features to embed_dim -> [B, L, embed_dim]
         text_tokens = self.text_proj(text_tokens)
 
         # ------------------------------------------------------------------
