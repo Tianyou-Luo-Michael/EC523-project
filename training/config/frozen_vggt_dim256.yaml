@@ -1,0 +1,8 @@
+defaults:
+  - frozen_vggt.yaml
+exp_name: frozen_vggt_dim256
+adapter_dim: 256
+optim:
+  lr: 3.0e-5
+  gradient_clip:
+    max_norm: 0.5

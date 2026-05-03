@@ -1,11 +1,12 @@
 import torch
+import torch.nn as nn
 import clip
 
 from vggt.models.vggt import VGGT
 from vggt.models.adapter import CrossAttentionAdapter
 
 
-class FrozenVGGT(VGGT):
+class FrozenVGGT_Multi_AllDPT(VGGT):
 
 
     def __init__(
@@ -25,42 +26,35 @@ class FrozenVGGT(VGGT):
             **vggt_kwargs,
         )
 
-
         object.__setattr__(self, '_clip_model', clip_model)
-
 
         for p in self.parameters():
             p.requires_grad_(False)
-
-
         for p in self._clip_model.parameters():
             p.requires_grad_(False)
 
+        self.target_indices = [4, 11, 17, 23]
 
-        d_model = embed_dim * 2
-
-
-        self.adapter = CrossAttentionAdapter(
-            d_model=d_model,
-            d_text=d_text,
-            adapter_dim=adapter_dim,
-        )
-
-        for p in self.adapter.parameters():
+        self.adapters = nn.ModuleList([
+            CrossAttentionAdapter(
+                d_model=embed_dim * 2,
+                d_text=d_text,
+                adapter_dim=adapter_dim,
+            )
+            for _ in self.target_indices
+        ])
+        for p in self.adapters.parameters():
             p.requires_grad_(True)
 
     @torch.no_grad()
     def _encode_captions(self, captions: list[str], device) -> torch.Tensor:
-
-
         text = clip.tokenize(captions, truncate=True).to(device)
         x = self._clip_model.token_embedding(text).type(self._clip_model.dtype)
         x = x + self._clip_model.positional_embedding.type(self._clip_model.dtype)
         x = x.permute(1, 0, 2)
         x = self._clip_model.transformer(x)
         x = x.permute(1, 0, 2)
-        x = self._clip_model.ln_final(x)
-        return x
+        return self._clip_model.ln_final(x)
 
     def forward(
         self,
@@ -68,43 +62,41 @@ class FrozenVGGT(VGGT):
         query_points: torch.Tensor = None,
         captions: list[str] = None,
     ) -> dict:
-
-
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-
         with torch.no_grad():
             aggregated_tokens_list, patch_start_idx = self.aggregator(images)
-
 
         if captions is not None:
             clip_seq = self._encode_captions(captions, images.device)
 
-
             with torch.cuda.amp.autocast(enabled=False):
-
-
                 tokens_f32   = [t.float() for t in aggregated_tokens_list]
                 clip_seq_f32 = clip_seq.float()
 
+                for adapter, idx in zip(self.adapters, self.target_indices):
+                    if idx >= len(tokens_f32):
+                        raise IndexError(
+                            f"target_idx={idx} out of range for "
+                            f"aggregated_tokens_list of length {len(tokens_f32)}"
+                        )
+                    B, S, N, D = tokens_f32[idx].shape
+                    clip_exp = (
+                        clip_seq_f32
+                        .unsqueeze(1)
+                        .expand(-1, S, -1, -1)
+                        .reshape(B * S, 77, -1)
+                    )
+                    delta = adapter(
+                        tokens_f32[idx].reshape(B * S, N, D),
+                        clip_exp,
+                    ).reshape(B, S, N, D)
+                    tokens_f32[idx] = tokens_f32[idx] + delta
 
-                B, S, N, D = tokens_f32[-1].shape
-                clip_seq_exp = clip_seq_f32.unsqueeze(1).expand(-1, S, -1, -1).reshape(B * S, 77, -1)
-
-                delta = self.adapter(
-                    tokens_f32[-1].reshape(B * S, N, D),
-                    clip_seq_exp,
-                )
-                delta = delta.reshape(B, S, N, D)
-
-                conditioned_final = tokens_f32[-1] + delta
-
-
-                aggregated_tokens_list = tokens_f32[:-1] + [conditioned_final]
-
+                aggregated_tokens_list = tokens_f32
 
         predictions = {}
 
@@ -147,3 +139,8 @@ class FrozenVGGT(VGGT):
             predictions["images"] = images
 
         return predictions
+
+    @property
+    def adapter(self):
+
+        return self.adapters[0]
