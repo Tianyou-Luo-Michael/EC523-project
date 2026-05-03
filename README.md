@@ -243,15 +243,6 @@ To reproduce the experiments:
 6. Update checkpoint paths in `evaluation.py`.
 7. Run `python evaluation.py` to generate the final metrics table.
 
-## Video Demos
-
-Add video demos here if available:
-
-```text
-Demo 1: <link or filename>
-Demo 2: <link or filename>
-```
-
 ## Citation
 
 This project builds on VGGT:
