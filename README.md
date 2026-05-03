@@ -1,6 +1,6 @@
 # Text-Conditioned 3D Reconstruction with VGGT
 
-**EC523 Deep Learning — Boston University**  
+**EC523 Deep Learning Boston University**  
 Timucin Erbas, Leroy Adisaputro, Azsadur Rakin, Tianyou Luo
 
 This project extends **VGGT** with text conditioning for 3D reconstruction. The original VGGT backbone is kept frozen, and natural language captions are injected into the reconstruction pipeline through lightweight cross-attention adapters. The goal is to test whether semantic text information can improve depth prediction and point-cloud reconstruction without retraining the full VGGT model.
