@@ -1,50 +1,36 @@
 defaults:
   - default_dataset.yaml
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FrozenVGGT training config
-#
-# Only the CrossAttentionAdapter (~3.4 M params) is trained.
-# VGGT aggregator + heads (1.2 B params) and CLIP (~400 M params) are frozen.
-# ─────────────────────────────────────────────────────────────────────────────
-
 exp_name: frozen_vggt_exp001
 img_size: 518
 patch_size: 14
-num_workers: 8
+num_workers: 0
 seed_value: 42
-accum_steps: 1          # increase if OOM; gradient accumulation is supported
+accum_steps: 1
 val_epoch_freq: 5
-max_img_per_gpu: 16     # lower than vanilla VGGT because two forward passes per step
+max_img_per_gpu: 8
 
 limit_train_batches: 500
 limit_val_batches: 100
 
-max_epochs: 30
+max_epochs: 10
 
-# ── FrozenVGGT-specific trainer kwargs ───────────────────────────────────────
-# These are passed directly to FrozenVGGTTrainer.__init__.
+clip_model_name: "ViT-B/32"
+vggt_model_name: "facebook/VGGT-1B"
+adapter_dim: 512
+caption_manifest_path: /projectnb/ec523/projects/proj_vggt/dataset/co3d_curated_captions_train.jsonl
+caption_mode: "concise"
+margin: 0.05
+margin_loss_weight: 0.5
 
-clip_model_name: "ViT-B/32"          # "ViT-L/14" supported; d_text auto-set to 768
-vggt_model_name: "facebook/VGGT-1B"  # HuggingFace model ID
-adapter_dim: 512                      # bottleneck dim of CrossAttentionAdapter
-caption_manifest_path: null           # path/to/captions.jsonl  (null = no captions)
-caption_mode: "concise"               # "concise" or "descriptive"
-margin: 0.01                          # lowered from 0.05; easier threshold to cross during early gate warm-up
-margin_loss_weight: 0.5               # weight on the margin loss term
-
-# VGGT head enable flags (passed through to FrozenVGGT init via **vggt_kwargs)
 enable_camera: True
 enable_depth: True
-enable_point: False   # set True + add point loss below to enable 3D point head
+enable_point: True
 enable_track: False
 
-# ── Dummy model section (not used by FrozenVGGTTrainer._setup_components) ────
-# Kept so Hydra parses the config cleanly; _target_ is informational only.
 model:
   _target_: vggt.models.frozen_vggt.FrozenVGGT
 
-# ── Data ─────────────────────────────────────────────────────────────────────
 data:
   train:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
@@ -60,8 +46,8 @@ data:
       dataset_configs:
         - _target_: data.datasets.co3d.Co3dDataset
           split: train
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+          CO3D_DIR: /projectnb/ec523/projects/proj_vggt/dataset/co3d_curated/
+          CO3D_ANNOTATION_DIR: /projectnb/ec523/projects/proj_vggt/dataset/co3d_curated_anno_split/
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
     num_workers: ${num_workers}
@@ -75,10 +61,9 @@ data:
       dataset_configs:
         - _target_: data.datasets.co3d.Co3dDataset
           split: test
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+          CO3D_DIR: /projectnb/ec523/projects/proj_vggt/dataset/co3d_curated/
+          CO3D_ANNOTATION_DIR: /projectnb/ec523/projects/proj_vggt/dataset/co3d_curated_anno_split/
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging:
   log_dir: logs/${exp_name}
   log_visuals: False
@@ -100,7 +85,10 @@ logging:
         - loss_conf_depth
         - loss_reg_depth
         - loss_grad_depth
-        - loss_margin         # FrozenVGGT-specific: caption margin loss
+        - loss_margin
+        - loss_conf_point
+        - loss_reg_point
+        - loss_grad_point
     val:
       keys_to_log:
         - loss_objective
@@ -112,17 +100,12 @@ logging:
         - loss_reg_depth
         - loss_grad_depth
 
-# ── Checkpoint ────────────────────────────────────────────────────────────────
-# Only adapter weights are saved (not VGGT or CLIP).
 checkpoint:
   save_dir: logs/${exp_name}/ckpts
-  save_freq: 5                     # also save checkpoint_N every N epochs
-  resume_checkpoint_path: null     # set to path/to/checkpoint.pt to resume
+  save_freq: 5
+  resume_checkpoint_path: null
   strict: False
 
-# ── Loss ──────────────────────────────────────────────────────────────────────
-# MultitaskLoss handles camera + depth supervision.
-# The margin loss is computed inside FrozenVGGTTrainer._step (not here).
 loss:
   _target_: loss.MultitaskLoss
   camera:
@@ -132,55 +115,40 @@ loss:
     weight: 1.0
     gradient_loss_fn: "grad"
     valid_range: 0.98
-  point: null
+  point:
+    weight: 1.0
+    gradient_loss_fn: "grad"
+    valid_range: 0.98
   track: null
 
-# ── Optimizer ─────────────────────────────────────────────────────────────────
-# All VGGT params have requires_grad=False, so AdamW only updates adapter params.
-# No frozen_module_names needed: freezing is handled inside FrozenVGGT.__init__.
 optim:
   param_group_modifiers: False
 
   optimizer:
     _target_: torch.optim.AdamW
-    lr: 3e-5       # was 1e-4; raw grad norms 8-32x the clip threshold → too aggressive
+    lr: 1e-4
     weight_decay: 1e-2
     betas: [0.9, 0.999]
 
-  frozen_module_names: null     # DO NOT set — FrozenVGGT handles its own freezing
+  frozen_module_names: null
 
   amp:
-    enabled: False       # FrozenVGGT manages its own dtypes internally; AMP provides no
-    amp_dtype: bfloat16  # benefit here and the GradScaler causes issues on NaN early-exit.
+    enabled: True
+    amp_dtype: bfloat16
 
   gradient_clip:
     _target_: train_utils.gradient_clip.GradientClipper
     configs:
       - module_name: ["adapter"]
-        max_norm: 0.5        # tighter clip: grad norm hit 32 before NaN
+        max_norm: 1.0
         norm_type: 2
 
-  options: null   # No fvcore LR scheduler — use plain AdamW with fixed LR.
-                  # Uncomment below to enable cosine warm-up decay:
-  # options:
-  #   lr:
-  #     - scheduler:
-  #         _target_: fvcore.common.param_scheduler.CompositeParamScheduler
-  #         schedulers:
-  #           - _target_: fvcore.common.param_scheduler.LinearParamScheduler
-  #             start_value: 1e-6
-  #             end_value: 1e-4
-  #           - _target_: fvcore.common.param_scheduler.CosineParamScheduler
-  #             start_value: 1e-4
-  #             end_value: 1e-7
-  #         lengths: [0.05, 0.95]
-  #         interval_scaling: ['rescaled', 'rescaled']
+  options: null
 
-# ── Distribution ──────────────────────────────────────────────────────────────
 distributed:
   backend: nccl
   comms_dtype: null
-  find_unused_parameters: False   # adapter is always used when captions provided
+  find_unused_parameters: False
   timeout_mins: 30
   gradient_as_bucket_view: True
   bucket_cap_mb: 25

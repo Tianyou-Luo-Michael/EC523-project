@@ -1,12 +1,3 @@
-# Trainer for FrozenVGGT: frozen VGGT backbone + frozen CLIP + trainable CrossAttentionAdapter.
-#
-# Inherits from Trainer and overrides:
-#   _setup_components  — builds FrozenVGGT (CLIP load + VGGT probe + weight copy)
-#   train_epoch        — keeps backbone in eval, only adapter in train mode
-#   _step              — two forward passes (correct + shuffled captions) + margin loss
-#   save_checkpoint    — saves adapter state dict + training metadata only
-#   _load_resuming_checkpoint — loads adapter weights from checkpoint
-
 import os
 import logging
 from typing import List, Mapping, Optional
@@ -27,21 +18,7 @@ from train_utils.optimizer import OptimizerWrapper
 
 
 class FrozenVGGTTrainer(Trainer):
-    """
-    Trainer for FrozenVGGT.
 
-    Only the CrossAttentionAdapter (~3.4 M params) is trainable.
-    The VGGT aggregator (1.2 B params) and CLIP encoder are frozen throughout.
-
-    Loss per step:
-        objective = MultitaskLoss(correct_preds, batch)
-                  + margin_loss_weight * margin_loss
-
-    Margin loss:
-        Given correct-caption depth and wrong-caption depth (detached),
-        penalise correct predictions that are worse than wrong by more than `margin`.
-        This encourages the adapter to use the caption meaningfully.
-    """
 
     def __init__(
         self,
@@ -50,7 +27,7 @@ class FrozenVGGTTrainer(Trainer):
         vggt_model_name: str = "facebook/VGGT-1B",
         adapter_dim: int = 512,
         caption_manifest_path: Optional[str] = None,
-        caption_mode: str = "concise",   # "concise" or "descriptive"
+        caption_mode: str = "concise",
         margin: float = 0.05,
         margin_loss_weight: float = 0.5,
         enable_camera: bool = True,
@@ -59,7 +36,7 @@ class FrozenVGGTTrainer(Trainer):
         enable_track: bool = False,
         **kwargs,
     ):
-        # Store before super().__init__ because _setup_components is called inside it.
+
         self.clip_model_name = clip_model_name
         self.vggt_model_name = vggt_model_name
         self.adapter_dim = adapter_dim
@@ -70,7 +47,7 @@ class FrozenVGGTTrainer(Trainer):
         self.enable_point = enable_point
         self.enable_track = enable_track
 
-        # Caption lookup: seq_name -> caption string
+
         if caption_manifest_path is not None:
             self.caption_lookup = load_caption_lookup_by_mode(
                 caption_manifest_path, mode=caption_mode
@@ -84,10 +61,6 @@ class FrozenVGGTTrainer(Trainer):
 
         super().__init__(**kwargs)
 
-    # ── Override optimizer construction ───────────────────────────────────────
-    # The parent __init__ calls construct_optimizers(self.model, self.optim_conf)
-    # which passes ALL named_parameters (1.2 B) to AdamW.  We shadow it so the
-    # parent's call transparently lands here and builds over adapter params only.
 
     @property
     def optims(self):
@@ -95,43 +68,35 @@ class FrozenVGGTTrainer(Trainer):
 
     @optims.setter
     def optims(self, value):
-        # Called by the parent as:  self.optims = construct_optimizers(...)
-        # We discard the incoming value (built from all params) and replace it
-        # with our adapter-only optimizer, built once the model is on device.
+
+
         if self.mode != "val":
             self._optims = self._build_optims()
         else:
             self._optims = value
 
-    # ── Component setup ───────────────────────────────────────────────────────
 
     def _setup_components(self):
-        """
-        Build FrozenVGGT:
-          1. Load CLIP to device (frozen, excluded from model state_dict).
-          2. Probe VGGT to discover the token dim at runtime.
-          3. Build FrozenVGGT (random init of adapter; frozen init of backbone).
-          4. Copy pretrained VGGT weights into FrozenVGGT via load_state_dict.
-          5. Verify param counts and adapter gate.
-        """
+
+
         logging.info("FrozenVGGTTrainer: setting up components")
         self.epoch = 0
         self.steps = {"train": 0, "val": 0}
 
-        # TensorBoard writer, loss, gradient clipper, AMP scaler
+
         self.tb_writer = instantiate(self.logging_conf.tensorboard_writer, _recursive_=False)
         self.loss = instantiate(self.loss_conf, _recursive_=False)
         self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
 
-        # ── (1) CLIP ─────────────────────────────────────────────────────────
+
         logging.info(f"Loading CLIP model: {self.clip_model_name}")
         clip_model, _ = clip.load(self.clip_model_name, device=self.device)
         for p in clip_model.parameters():
             p.requires_grad_(False)
         clip_model.eval()
 
-        # ── (2) Probe VGGT for token dim ─────────────────────────────────────
+
         logging.info(f"Probing VGGT ({self.vggt_model_name}) for token dim …")
         _probe = VGGT.from_pretrained(self.vggt_model_name).to(self.device)
         _probe.eval()
@@ -146,10 +111,10 @@ class FrozenVGGTTrainer(Trainer):
 
         logging.info(f"VGGT token dim: d_model={d_model}, embed_dim={embed_dim}")
 
-        # d_text: 512 for ViT-B/32, 768 for ViT-L/14
+
         d_text = 768 if "ViT-L" in self.clip_model_name else 512
 
-        # ── (3) Build FrozenVGGT ──────────────────────────────────────────────
+
         self.model = FrozenVGGT(
             clip_model=clip_model,
             img_size=518,
@@ -163,9 +128,7 @@ class FrozenVGGTTrainer(Trainer):
             enable_track=self.enable_track,
         )
 
-        # ── (4) Copy pretrained VGGT weights ─────────────────────────────────
-        # strict=False: adapter params exist in FrozenVGGT but not in the probe.
-        # State dict is extracted on CPU to avoid device-mismatch surprises.
+
         probe_state = {k: v.cpu() for k, v in _probe.state_dict().items()}
         missing, unexpected = self.model.load_state_dict(probe_state, strict=False)
         if self.rank == 0:
@@ -173,23 +136,12 @@ class FrozenVGGTTrainer(Trainer):
                 f"VGGT weights loaded. Missing (adapter expected): {missing}"
             )
             if unexpected:
-                # Unexpected keys are disabled heads (point_head/track_head) whose
-                # weights exist in the vanilla VGGT probe but not in FrozenVGGT
-                # because enable_point=False / enable_track=False.  This is normal.
-                disabled_prefixes = ("point_head.", "track_head.")
-                real_unexpected = [k for k in unexpected if not k.startswith(disabled_prefixes)]
-                if real_unexpected:
-                    logging.warning(f"Truly unexpected keys: {real_unexpected}")
-                else:
-                    logging.info(
-                        f"Skipped {len(unexpected)} disabled-head keys "
-                        f"(point_head/track_head) — expected when enable_point/track=False."
-                    )
+                logging.warning(f"Unexpected keys: {unexpected}")
 
         del _probe, probe_state
         torch.cuda.empty_cache()
 
-        # ── (5) Verify ────────────────────────────────────────────────────────
+
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.model.parameters())
         if self.rank == 0:
@@ -206,39 +158,23 @@ class FrozenVGGTTrainer(Trainer):
             model_summary(self.model, log_file=model_summary_path)
             logging.info(f"Model summary → {model_summary_path}")
 
-    # ── Training mode helpers ─────────────────────────────────────────────────
 
     def _inner_model(self) -> FrozenVGGT:
-        """Unwrap DDP to access the FrozenVGGT module."""
+
         if isinstance(self.model, nn.parallel.DistributedDataParallel):
             return self.model.module
         return self.model
 
     def _set_frozen_train_mode(self):
-        """
-        Backbone (aggregator + heads) in eval mode — suppresses dropout and
-        keeps BatchNorm statistics frozen, exactly as at inference.
-        Only the adapter is put in train mode so its dropout / BN (if any) behave.
 
-        NOTE: calls nn.Module.train(model, False) directly instead of
-        self.model.eval() because nn.Module.eval() is implemented as
-        self.train(False), which would hit any instance-level patch on .train
-        and cause infinite recursion.
-        """
-        nn.Module.train(self.model, False)   # entire model → eval mode
-        self._inner_model().adapter.train()  # adapter only → train mode
 
-    # ── Per-step forward + loss ───────────────────────────────────────────────
+        nn.Module.train(self.model, False)
+        self._inner_model().adapter.train()
+
 
     def _get_captions(self, batch: Mapping) -> Optional[List[str]]:
-        """
-        Resolve captions for the batch.
 
-        Priority:
-          1. batch["captions"]          — dataset provides captions directly
-          2. caption_lookup[seq_name]   — look up by sequence name from manifest
-          3. None                       — vanilla VGGT behaviour (adapter skipped)
-        """
+
         if "captions" in batch:
             return list(batch["captions"])
         if self.caption_lookup and "seq_name" in batch:
@@ -257,36 +193,18 @@ class FrozenVGGTTrainer(Trainer):
         phase: str,
         loss_meters: dict,
     ) -> dict:
-        """
-        Single forward step for FrozenVGGT.
 
-        Training:
-          - Enforce frozen-backbone training mode before every forward.
-          - Run two forward passes: correct captions + shuffled captions.
-          - loss = MultitaskLoss(correct) + margin_loss_weight * margin_loss
 
-        Validation:
-          - Single forward pass with correct captions (no margin loss).
-        """
         if phase == "train":
             self._set_frozen_train_mode()
 
         captions = self._get_captions(batch)
         images = batch["images"]
 
-        # ── (a) Correct-caption forward ────────────────────────────────────
+
         predictions = model(images=images, captions=captions)
 
-        # ── (b) Multi-task loss on correct predictions ─────────────────────
-        # Detach confidence tensors before the loss call so the adapter is
-        # trained only via regression accuracy (depth/camera errors), not by
-        # exploiting the confidence term.  Without this, the adapter learns to
-        # push frozen-head tokens toward high-confidence directions, creating a
-        # runaway: higher conf → more negative loss_conf_depth → gradient pushes
-        # conf higher → gradient norm blows up → NaN.
-        # Detaching conf makes loss_conf_depth = γ·err·c_detach - α·log(c_detach),
-        # which is a per-pixel-weighted regression loss (weight = c_detach).
-        # The logged conf values are still the live (non-detached) outputs.
+
         loss_predictions = {**predictions}
         if "depth_conf" in loss_predictions:
             loss_predictions["depth_conf"] = loss_predictions["depth_conf"].detach()
@@ -294,18 +212,18 @@ class FrozenVGGTTrainer(Trainer):
             loss_predictions["world_points_conf"] = loss_predictions["world_points_conf"].detach()
         loss_dict = self.loss(loss_predictions, batch)
 
-        # ── (c) Margin loss (training + captions only) ─────────────────────
+
         if phase == "train" and captions is not None and "depth" in predictions:
-            # Shuffle captions: each scene gets a wrong description.
+
             idx_wrong = torch.randperm(len(captions))
             captions_wrong = [captions[i] for i in idx_wrong]
 
-            # Wrong-caption forward pass — no gradient needed.
+
             with torch.no_grad():
                 preds_wrong = model(images=images, captions=captions_wrong)
 
-            depth_correct = predictions["depth"].squeeze(-1)   # [B, S, H, W]
-            depth_wrong = preds_wrong["depth"].squeeze(-1)     # [B, S, H, W]
+            depth_correct = predictions["depth"].squeeze(-1)
+            depth_wrong = preds_wrong["depth"].squeeze(-1)
 
             valid = (
                 batch["point_masks"].bool()
@@ -316,12 +234,12 @@ class FrozenVGGTTrainer(Trainer):
 
             n_valid = valid.sum().item()
             if n_valid == 0:
-                # No valid depth pixels in this batch — skip margin loss entirely
-                # rather than letting .mean() on an empty tensor produce nan.
-                loss_margin = depth_correct.sum() * 0.0   # zero, keeps grad_fn alive
+
+
+                loss_margin = depth_correct.sum() * 0.0
             else:
-                # err_wrong is detached — comparison target only, no gradient.
-                # err_correct_live carries gradient → adapter params.
+
+
                 err_wrong = (depth_wrong[valid] - gt_depth[valid]).abs().detach()
                 err_correct_live = (depth_correct[valid] - gt_depth[valid]).abs()
 
@@ -334,12 +252,12 @@ class FrozenVGGTTrainer(Trainer):
                 loss_dict["objective"] + self.margin_loss_weight * loss_margin
             )
 
-        # ── (d) Logging ────────────────────────────────────────────────────
+
         log_data = {**predictions, **loss_dict, **batch}
         self._update_and_log_scalars(log_data, phase, self.steps[phase], loss_meters)
         self._log_tb_visuals(log_data, phase, self.steps[phase])
 
-        # Log adapter gate (rank-0 only, at log_freq)
+
         if (
             self.rank == 0
             and self.steps[phase] % self.logging_conf.log_freq == 0
@@ -355,54 +273,29 @@ class FrozenVGGTTrainer(Trainer):
         self.steps[phase] += 1
         return loss_dict
 
-    # ── Optimizer (adapter params only) ──────────────────────────────────────
 
     def _build_optims(self):
-        """
-        Build AdamW over adapter parameters only.
 
-        The base construct_optimizer passes ALL model.named_parameters() to
-        AdamW, which would allocate momentum buffers for 1.2 B frozen VGGT
-        params — wasting ~2.4 GB of GPU memory for state that is never used.
-        Here we filter to requires_grad=True params before constructing the
-        optimizer, then wrap in the same OptimizerWrapper the rest of the
-        trainer expects.
-        """
+
         import hydra
         trainable_params = [
             p for p in self.model.parameters() if p.requires_grad
         ]
         assert trainable_params, "No trainable parameters found — adapter may not be built yet."
         optimizer = hydra.utils.instantiate(self.optim_conf.optimizer, trainable_params)
-        # schedulers must be a list of dicts (one per param group), not None.
-        # The parent's train_epoch does `for option in optim.schedulers[j]` without
-        # guarding for None, so passing None would crash with TypeError.
-        # Empty dicts mean "no scheduler" — the loop body simply never executes.
+
+
         schedulers = [{} for _ in optimizer.param_groups]
         return [OptimizerWrapper(optimizer, schedulers)]
 
-    # ── Checkpoint ────────────────────────────────────────────────────────────
 
     def save_checkpoint(
         self, epoch: int, checkpoint_names: Optional[List[str]] = None
     ):
-        """
-        Save adapter-only checkpoint.
 
-        Saved keys:
-          adapter    — adapter.state_dict()  (the only part we train)
-          epoch      — current epoch
-          steps      — train/val step counters
-          optimizer  — AdamW state for adapter params
-          scaler     — AMP GradScaler state (if AMP enabled)
-          time_elapsed
 
-        VGGT weights and CLIP weights are NOT saved here.
-        VGGT is loaded from the pretrained hub checkpoint at run time.
-        CLIP is loaded from openai/CLIP at run time.
-        """
         if self.distributed_rank != 0:
-            # Only rank-0 writes checkpoints.
+
             dist.barrier()
             return
 
@@ -441,12 +334,8 @@ class FrozenVGGTTrainer(Trainer):
         dist.barrier()
 
     def _load_resuming_checkpoint(self, ckpt_path: str):
-        """
-        Load adapter weights + training state from an adapter checkpoint.
 
-        Also handles legacy full-model checkpoints by extracting adapter.*
-        keys if present.
-        """
+
         logging.info(
             f"FrozenVGGTTrainer: resuming from {ckpt_path} (rank {self.rank})"
         )
@@ -464,7 +353,7 @@ class FrozenVGGTTrainer(Trainer):
                     f"Unexpected: {unexpected or 'None'}."
                 )
         elif "model" in checkpoint:
-            # Legacy full-model checkpoint — extract adapter.* keys.
+
             adapter_state = {
                 k.removeprefix("adapter."): v
                 for k, v in checkpoint["model"].items()
@@ -476,7 +365,7 @@ class FrozenVGGTTrainer(Trainer):
             else:
                 logging.warning("No adapter.* keys found in checkpoint['model'].")
 
-        # Optimizer state
+
         if "optimizer" in checkpoint:
             opt_state = checkpoint["optimizer"]
             if isinstance(opt_state, dict):
@@ -485,7 +374,7 @@ class FrozenVGGTTrainer(Trainer):
                 for optim, state in zip(self.optims, opt_state):
                     optim.optimizer.load_state_dict(state)
 
-        # Training progress
+
         if "epoch" in checkpoint:
             self.epoch = checkpoint["epoch"] + 1
 

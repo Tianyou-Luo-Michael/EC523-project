@@ -1,0 +1,4 @@
+defaults:
+  - frozen_vggt.yaml
+
+exp_name: frozen_vggt_aggregator_12
